@@ -8,4 +8,7 @@ pub mod constants;
 pub mod dyn_array;
 pub mod hash_table;
 pub mod limits;
+pub mod log;
+pub mod platform;
 pub mod str_util;
+pub mod system_info;

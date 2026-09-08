@@ -5,7 +5,6 @@
 //! limit is env-overridable so an operator can tune it per-repo without a
 //! rebuild.
 
-use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Result of an attempted per-file read, so callers can attribute a skip to
 /// the right phase/reason instead of collapsing every failure into
@@ -82,6 +81,7 @@ fn env_positive_int(name: &str, fallback: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Serialize env mutations across tests (env is process-global).
     static ENV_LOCK: AtomicU8 = AtomicU8::new(0);
