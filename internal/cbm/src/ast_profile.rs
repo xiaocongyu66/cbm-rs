@@ -213,14 +213,18 @@ fn kind_static(kind: &str) -> &'static str {
     unsafe { std::mem::transmute::<&str, &'static str>(kind) }
 }
 
+struct DataFlowCtx<'a> {
+    source: &'a str,
+    param_names: &'a [&'a str],
+    in_return: bool,
+    in_condition: bool,
+}
+
 fn accumulate_data_flow(
     node: tree_sitter::Node<'_>,
     kind: &str,
     child_count: usize,
-    source: &str,
-    param_names: &[&str],
-    in_return: bool,
-    in_condition: bool,
+    ctx: &DataFlowCtx<'_>,
     out: &mut AstProfile,
 ) {
     if !(child_count == 0 && is_identifier_kind(kind)) {
@@ -231,14 +235,14 @@ fn accumulate_data_flow(
     if end <= start || end - start >= 128 {
         return;
     }
-    let ident = &source[start..end.min(source.len())];
-    if !param_names.contains(&ident) {
+    let ident = &ctx.source[start..end.min(ctx.source.len())];
+    if !ctx.param_names.contains(&ident) {
         return;
     }
-    if in_return {
+    if ctx.in_return {
         out.params_in_returns += 1;
     }
-    if in_condition {
+    if ctx.in_condition {
         out.params_in_conditions += 1;
     }
 }
@@ -284,10 +288,12 @@ pub fn compute(
                 node,
                 kind,
                 child_count,
-                source,
-                param_names,
-                in_return,
-                in_condition,
+                &DataFlowCtx {
+                    source,
+                    param_names,
+                    in_return,
+                    in_condition,
+                },
                 out,
             );
             if is_control_if(kind) || is_control_while(kind) {
@@ -310,9 +316,11 @@ pub fn compute(
         }
     }
 
-    if node_count > 0 {
-        out.avg_nesting_depth_x10 = ((total_depth * DEPTH_SCALE) / node_count) as u16;
-    }
+    out.avg_nesting_depth_x10 = if node_count > 0 {
+        ((total_depth * DEPTH_SCALE) / node_count) as u16
+    } else {
+        0
+    };
     node_count > 0
 }
 
