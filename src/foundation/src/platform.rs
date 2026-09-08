@@ -119,10 +119,12 @@ pub fn file_size(path: &Path) -> i64 {
 /// keeps project keys consistent regardless of agent-reported case
 /// (upstream #227/#367/#394).
 pub fn normalize_path_sep(path: &str) -> String {
-    let mut s: Vec<u8> = path.bytes().map(|b| if b == b'\\' { b'/' } else { b }).collect();
+    let mut s: Vec<u8> = path
+        .bytes()
+        .map(|b| if b == b'\\' { b'/' } else { b })
+        .collect();
     // Canonicalize a strict drive-root form "x:/" or bare "x:" → "X:…".
-    if s.len() >= 2 && s[0].is_ascii_lowercase() && s[1] == b':' && (s.len() == 2 || s[2] == b'/')
-    {
+    if s.len() >= 2 && s[0].is_ascii_lowercase() && s[1] == b':' && (s.len() == 2 || s[2] == b'/') {
         s[0] = s[0].to_ascii_uppercase();
     }
     String::from_utf8(s).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
@@ -189,10 +191,10 @@ pub fn resolve_cache_dir() -> Option<String> {
     Some(format!("{home}/.cache/codebase-memory-mcp"))
 }
 
-/// Cached host info — re-export of [`crate::system_info::system_info`].
-pub use crate::system_info::system_info;
 /// Worker count — re-export of [`crate::system_info::default_worker_count`].
 pub use crate::system_info::default_worker_count;
+/// Cached host info — re-export of [`crate::system_info::system_info`].
+pub use crate::system_info::system_info;
 
 #[cfg(test)]
 mod tests {

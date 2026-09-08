@@ -76,8 +76,10 @@ pub const PAIR_LEN: usize = 2;
 /// fails CI rather than quietly shrinking query results.
 pub const SQL_TYPE_LIKE_LABELS: &str = "'Class','Struct','Interface','Enum','Type','Trait'";
 pub const SQL_CALLABLE_LABELS: &str = "'Function','Method'";
-pub const SQL_CALLABLE_OR_TYPE_LABELS: &str =
-    concat!("'Function','Method',", "'Class','Struct','Interface','Enum','Type','Trait'");
+pub const SQL_CALLABLE_OR_TYPE_LABELS: &str = concat!(
+    "'Function','Method',",
+    "'Class','Struct','Interface','Enum','Type','Trait'"
+);
 /// SQL mirror of `label_is_relation()` (data-lineage nodes).
 pub const SQL_RELATION_LABELS: &str = "'Table','View','Model'";
 

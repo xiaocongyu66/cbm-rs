@@ -5,7 +5,6 @@
 //! limit is env-overridable so an operator can tune it per-repo without a
 //! rebuild.
 
-
 /// Result of an attempted per-file read, so callers can attribute a skip to
 /// the right phase/reason instead of collapsing every failure into
 /// "read failed".
@@ -68,12 +67,10 @@ fn parse_positive(raw: &str) -> Option<i64> {
 
 fn env_positive_int(name: &str, fallback: i32) -> i32 {
     match std::env::var(name) {
-        Ok(raw) if !raw.is_empty() => {
-            parse_positive(&raw)
-                .filter(|&v| v <= i32::MAX as i64)
-                .map(|v| v as i32)
-                .unwrap_or(fallback)
-        }
+        Ok(raw) if !raw.is_empty() => parse_positive(&raw)
+            .filter(|&v| v <= i32::MAX as i64)
+            .map(|v| v as i32)
+            .unwrap_or(fallback),
         _ => fallback,
     }
 }
@@ -104,8 +101,12 @@ mod tests {
         with_env("CBM_MAX_FILE_BYTES", None, || {
             assert_eq!(max_file_bytes(), 512 * 1024 * 1024);
         });
-        with_env("CBM_CYPHER_MAX_DEPTH", None, || assert_eq!(cypher_max_depth(), 10));
-        with_env("CBM_MCP_MAX_DEPTH", None, || assert_eq!(mcp_max_depth(), 15));
+        with_env("CBM_CYPHER_MAX_DEPTH", None, || {
+            assert_eq!(cypher_max_depth(), 10)
+        });
+        with_env("CBM_MCP_MAX_DEPTH", None, || {
+            assert_eq!(mcp_max_depth(), 15)
+        });
     }
 
     #[test]
@@ -113,8 +114,12 @@ mod tests {
         with_env("CBM_MAX_FILE_BYTES", Some("1048576"), || {
             assert_eq!(max_file_bytes(), 1_048_576);
         });
-        with_env("CBM_CYPHER_MAX_DEPTH", Some("3"), || assert_eq!(cypher_max_depth(), 3));
-        with_env("CBM_MCP_MAX_DEPTH", Some("40"), || assert_eq!(mcp_max_depth(), 40));
+        with_env("CBM_CYPHER_MAX_DEPTH", Some("3"), || {
+            assert_eq!(cypher_max_depth(), 3)
+        });
+        with_env("CBM_MCP_MAX_DEPTH", Some("40"), || {
+            assert_eq!(mcp_max_depth(), 40)
+        });
     }
 
     #[test]

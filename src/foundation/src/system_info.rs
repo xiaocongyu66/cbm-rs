@@ -75,9 +75,7 @@ pub fn detect_cgroup_cpus(cgroup_root: &str) -> i32 {
 /// Effective memory limit (bytes) from a cgroup file tree; 0 = unlimited.
 pub fn detect_cgroup_mem(cgroup_root: &str) -> u64 {
     // cgroup v2: "max" or integer bytes.
-    if let Some(buf) =
-        read_small_file(std::path::Path::new(&format!("{cgroup_root}/memory.max")))
-    {
+    if let Some(buf) = read_small_file(std::path::Path::new(&format!("{cgroup_root}/memory.max"))) {
         if buf.starts_with("max") {
             return 0;
         }
@@ -161,7 +159,10 @@ pub fn default_worker_count(initial: bool) -> i32 {
                 return n;
             }
         }
-        crate::log::warn("workers.env.invalid", &[("value", raw.as_str()), ("fallback", "sysconf")]);
+        crate::log::warn(
+            "workers.env.invalid",
+            &[("value", raw.as_str()), ("fallback", "sysconf")],
+        );
     }
     let info = system_info();
     if initial {
@@ -182,7 +183,7 @@ mod tests {
         let info = system_info();
         assert!(info.total_cores >= 1);
         assert_eq!(info.perf_cores, info.total_cores); // Linux
-        // This test box has RAM; container cap (if any) must be > 0.
+                                                       // This test box has RAM; container cap (if any) must be > 0.
         assert!(info.total_ram > 0, "got {}", info.total_ram);
     }
 

@@ -129,7 +129,10 @@ impl Arena {
             let b = self.blocks.pop().expect("len checked");
             // SAFETY: block was allocated with this layout.
             unsafe {
-                dealloc(b.ptr, Layout::from_size_align(b.size, ALIGN).expect("overflow"));
+                dealloc(
+                    b.ptr,
+                    Layout::from_size_align(b.size, ALIGN).expect("overflow"),
+                );
             }
         }
         if let Some(first) = self.blocks.first() {
@@ -158,7 +161,10 @@ impl Drop for Arena {
         for b in &self.blocks {
             // SAFETY: allocated in push_block with identical layout.
             unsafe {
-                dealloc(b.ptr, Layout::from_size_align(b.size, ALIGN).expect("overflow"));
+                dealloc(
+                    b.ptr,
+                    Layout::from_size_align(b.size, ALIGN).expect("overflow"),
+                );
             }
         }
         self.blocks.clear();

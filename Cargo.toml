@@ -7,6 +7,9 @@ version = "0.10.8"
 edition = "2021"
 license = "MIT"
 
+[workspace.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

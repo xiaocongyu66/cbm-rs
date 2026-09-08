@@ -7,7 +7,6 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Level {
@@ -67,10 +66,13 @@ pub fn get_level() -> Level {
 }
 
 pub fn set_format(format: Format) {
-    LOG_FORMAT.store(match format {
-        Format::Text => 0,
-        Format::Json => 1,
-    }, Ordering::Relaxed);
+    LOG_FORMAT.store(
+        match format {
+            Format::Text => 0,
+            Format::Json => 1,
+        },
+        Ordering::Relaxed,
+    );
 }
 
 pub fn get_format() -> Format {
@@ -243,10 +245,7 @@ pub fn http_request(
     request_bytes: usize,
     response_bytes: usize,
 ) {
-    let safe_path: String = path
-        .chars()
-        .take_while(|&c| c != '?' && c != '#')
-        .collect();
+    let safe_path: String = path.chars().take_while(|&c| c != '?' && c != '#').collect();
     let level = if status >= 500 {
         Level::Error
     } else if status >= 400 {
@@ -293,7 +292,10 @@ mod tests {
         install(g2, false);
         info("filtered.out", &[("k", "v")]); // below level — must not hit sink
         warn("kept.msg", &[("a", "1"), ("b", "2")]);
-        assert_eq!(got.lock().unwrap().as_str(), "level=warn msg=kept.msg a=1 b=2");
+        assert_eq!(
+            got.lock().unwrap().as_str(),
+            "level=warn msg=kept.msg a=1 b=2"
+        );
         set_level(Level::Info);
     }
 

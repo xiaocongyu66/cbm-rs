@@ -23,7 +23,10 @@ impl<T> HashTable<T> {
     /// Create with an initial capacity hint (0 = library default).
     pub fn create(initial_capacity: u32) -> Self {
         HashTable {
-            map: HashMap::with_capacity_and_hasher(initial_capacity as usize, BuildHasher::default()),
+            map: HashMap::with_capacity_and_hasher(
+                initial_capacity as usize,
+                BuildHasher::default(),
+            ),
         }
     }
 

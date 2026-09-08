@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Rust rewrite of codebase-memory-mcp src/foundation layer"
+
+[dependencies]
+libc = { workspace = true }
