@@ -614,7 +614,6 @@ mod tests {
     fn manifest_name_const() {
         assert_eq!(WS_MANIFEST_NAME, ".cbmpathwhitelist");
         assert_eq!(WS_MANIFEST_NAME, ".cbmpathwhitelist");
-        // Components, not prefixes: the manifest never starts with a "." component.
-        assert!(!Path::new(WS_MANIFEST_NAME).starts_with("."));
+        assert!(WS_MANIFEST_NAME.starts_with('.'));
     }
 }
