@@ -19,6 +19,7 @@ pub mod mem;
 pub mod mem_override_win;
 pub mod mem_profile;
 pub mod platform;
+pub mod private_file_lock;
 pub mod profile;
 pub mod secure_random;
 pub mod sha256;
