@@ -9,6 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 libc = "0.2"
+regex = "1"
 
 [profile.release]
 opt-level = 3

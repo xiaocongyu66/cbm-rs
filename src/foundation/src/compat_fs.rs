@@ -237,10 +237,17 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> i32 {
             .truncate(true)
             .open(dst),
     ) {
-        // FICLONE = 0x40049409 (linux/fs.h)
-        const FICLONE: libc::c_ulong = 0x40049409;
-        let cloned =
-            unsafe { libc::ioctl(fout.as_raw_fd(), FICLONE, fin.as_raw_fd() as libc::c_ulong) };
+        // FICLONE = 0x40049409 (linux/fs.h). musl's ioctl request param is
+        // c_int, glibc's c_ulong — pass through c_int and let the binding
+        // sign-extend where needed.
+        const FICLONE: libc::c_int = 0x40049409u32 as libc::c_int;
+        let cloned = unsafe {
+            libc::ioctl(
+                fout.as_raw_fd(),
+                FICLONE as libc::c_ulong,
+                fin.as_raw_fd() as libc::c_ulong,
+            )
+        };
         if cloned == 0 {
             return 0;
         }

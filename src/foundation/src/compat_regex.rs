@@ -100,8 +100,9 @@ impl Regex {
         }
         for (i, slot) in matches.iter_mut().take(n).enumerate() {
             *slot = Regmatch {
-                rm_so: pmatch[i].rm_so,
-                rm_eo: pmatch[i].rm_eo,
+                // regoff_t is i32 on glibc, i64 on musl — normalize.
+                rm_so: pmatch[i].rm_so as i32,
+                rm_eo: pmatch[i].rm_eo as i32,
             };
         }
         REG_OK
