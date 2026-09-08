@@ -41,33 +41,32 @@ impl InternPool {
         }
     }
 
-    /// Intern `s`; returns the canonical (pool-owned) string.
-    pub fn intern(&mut self, s: &str) -> &str {
+    /// Intern `s`; returns the canonical (pool-owned) string as a raw
+    /// pointer, mirroring the C `const char*` return: valid for the pool's
+    /// lifetime, not lifetime-tied to this borrow.
+    pub fn intern(&mut self, s: &str) -> *const str {
         self.intern_n(s, s.len())
     }
 
     /// Intern the first `len` bytes of `s`.
-    pub fn intern_n(&mut self, s: &str, len: usize) -> &str {
+    pub fn intern_n(&mut self, s: &str, len: usize) -> *const str {
         let len = len.min(s.len());
-        // SAFETY-free path: caller guarantees a char boundary (C took raw
-        // bytes); for safety we clamp to the nearest boundary upward.
+        // C took raw bytes; for safety clamp to the nearest char boundary.
         let mut end = len;
         while end < s.len() && !s.is_char_boundary(end) {
             end += 1;
         }
         let slice = &s[..end];
         let key: Box<str> = slice.into();
-        match self.map.get(&key) {
-            Some(()) => {}
-            None => {
-                self.total_bytes += key.len();
-                self.map.insert(key, ());
-            }
+        if !self.map.contains_key(&key) {
+            self.total_bytes += key.len();
+            self.map.insert(key, ());
         }
-        // Return canonical reference.
-        let key: Box<str> = slice.into();
-        let stored = self.map.get_key_value(&key).0;
-        stored.as_ref()
+        let (k, _) = self
+            .map
+            .get_key_value(&Box::<str>::from(slice))
+            .expect("just inserted");
+        &**k as *const str
     }
 
     /// Number of distinct interned strings.
@@ -95,8 +94,8 @@ mod tests {
         let mut p = InternPool::create();
         let a = p.intern("hello");
         let b = p.intern("hello");
-        assert_eq!(a, "hello");
-        assert_eq!(a.as_ptr(), b.as_ptr()); // canonical single storage
+        assert!(std::ptr::eq(a, b)); // canonical single storage
+        assert_eq!(unsafe { a.as_ref().unwrap() }, "hello");
         assert_eq!(p.count(), 1);
         assert_eq!(p.bytes(), 5);
     }
@@ -105,7 +104,7 @@ mod tests {
     fn intern_n_truncates() {
         let mut p = InternPool::create();
         let s = p.intern_n("abcdef", 3);
-        assert_eq!(s, "abc");
+        assert_eq!(unsafe { s.as_ref().unwrap() }, "abc");
         assert_eq!(p.count(), 1);
         // Interning the full string adds a second entry.
         p.intern("abcdef");

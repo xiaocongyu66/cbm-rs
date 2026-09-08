@@ -16,5 +16,7 @@ pub mod log;
 pub mod platform;
 pub mod secure_random;
 pub mod sha256;
+pub mod str_intern;
 pub mod str_util;
 pub mod system_info;
+pub mod vmem;
