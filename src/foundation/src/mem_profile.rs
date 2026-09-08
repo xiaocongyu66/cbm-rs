@@ -120,9 +120,11 @@ pub fn threshold() -> usize {
 }
 
 fn capture(frames: &mut [usize; FRAMES], caller: Option<usize>) -> usize {
+    #[cfg(all(not(test), not(target_env = "gnu")))]
+    let _ = frames;
     // backtrace(3) is glibc-only (absent from musl's libc bindings); musl
     // targets degrade to capture_failed, preserving totals semantics.
-    #[cfg(all(not(test), gnu))]
+    #[cfg(all(not(test), target_env = "gnu"))]
     unsafe {
         let mut raw: [*mut libc::c_void; FRAMES + SKIP_FRAMES] =
             [std::ptr::null_mut(); FRAMES + SKIP_FRAMES];
@@ -136,7 +138,7 @@ fn capture(frames: &mut [usize; FRAMES], caller: Option<usize>) -> usize {
         }
         count
     }
-    #[cfg(all(not(test), not(gnu)))]
+    #[cfg(all(not(test), not(target_env = "gnu")))]
     {
         let _ = caller;
         0
