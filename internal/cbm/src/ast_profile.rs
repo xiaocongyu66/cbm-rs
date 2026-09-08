@@ -316,11 +316,9 @@ pub fn compute(
         }
     }
 
-    out.avg_nesting_depth_x10 = if node_count > 0 {
-        ((total_depth * DEPTH_SCALE) / node_count) as u16
-    } else {
-        0
-    };
+    out.avg_nesting_depth_x10 = ((total_depth * DEPTH_SCALE)
+        .checked_div(node_count)
+        .unwrap_or(0)) as u16;
     node_count > 0
 }
 
