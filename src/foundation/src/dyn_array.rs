@@ -16,21 +16,19 @@ pub use std::vec::Vec as DynArray;
 /// C `cbm_da_reserve(da, n)` → `da.reserve(n)` (grow-only, same)
 /// C `cbm_da_insert(da, idx, item)` → `da.insert(idx, item)`
 /// C `cbm_da_remove(da, idx)` → `da.remove(idx)`
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The C header's own usage example, expressed with the Rust mapping.
     #[test]
+    #[allow(clippy::vec_init_then_push)]
     fn c_header_example_translated() {
         let mut nums: DynArray<i32> = DynArray::new(); // {0}
-        nums.push(42); // cbm_da_push
-        nums.push(99);
-        let mut out = Vec::new();
-        for i in 0..nums.len() {
-            out.push(nums[i]);
+        for x in [42, 99] {
+            nums.push(x); // cbm_da_push
         }
+        let out: Vec<i32> = nums.iter().copied().collect();
         assert_eq!(out, vec![42, 99]);
         // cbm_da_free is implicit in drop.
     }
