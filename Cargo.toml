@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src/foundation"]
+members = ["src/foundation", "internal/cbm"]
 
 [workspace.package]
 version = "0.10.8"

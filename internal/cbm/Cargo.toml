@@ -1,0 +1,9 @@
+[package]
+name = "cbm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust rewrite of codebase-memory-mcp internal/cbm extraction engine"
+
+[dependencies]
+cbm-foundation = { path = "../../src/foundation" }

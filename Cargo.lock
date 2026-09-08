@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "cbm-core"
+version = "0.10.8"
+dependencies = [
+ "cbm-foundation",
+]
+
+[[package]]
 name = "cbm-foundation"
 version = "0.10.8"
 dependencies = [
