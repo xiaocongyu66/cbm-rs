@@ -6,7 +6,6 @@
 //! avoid storms near the budget boundary.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 const MB: usize = 1024 * 1024;
 
@@ -208,7 +207,7 @@ mod tests {
     use super::*;
 
     // Serialize tests that touch global statics.
-    static LOCK: Mutex<()> = Mutex::new(());
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn alloc_roundtrip_and_tracking() {
