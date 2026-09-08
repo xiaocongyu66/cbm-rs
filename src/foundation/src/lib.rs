@@ -9,6 +9,7 @@ pub mod compat_fs;
 pub mod compat_regex;
 pub mod compat_thread;
 pub mod constants;
+pub mod dump_verify;
 pub mod dyn_array;
 pub mod hash_table;
 pub mod limits;
