@@ -120,9 +120,9 @@ pub fn threshold() -> usize {
 }
 
 fn capture(frames: &mut [usize; FRAMES], caller: Option<usize>) -> usize {
-    #[cfg(not(test))]
-    let _ = caller;
-    #[cfg(not(test))]
+    // backtrace(3) is glibc-only (absent from musl's libc bindings); musl
+    // targets degrade to capture_failed, preserving totals semantics.
+    #[cfg(all(not(test), gnu))]
     unsafe {
         let mut raw: [*mut libc::c_void; FRAMES + SKIP_FRAMES] =
             [std::ptr::null_mut(); FRAMES + SKIP_FRAMES];
@@ -135,6 +135,11 @@ fn capture(frames: &mut [usize; FRAMES], caller: Option<usize>) -> usize {
             *slot = raw[i + SKIP_FRAMES] as usize;
         }
         count
+    }
+    #[cfg(all(not(test), not(gnu)))]
+    {
+        let _ = caller;
+        0
     }
     // Test builds have no malloc hook path; synthesize a stack from the caller.
     #[cfg(test)]
