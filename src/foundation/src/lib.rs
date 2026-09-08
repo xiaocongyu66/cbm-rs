@@ -27,6 +27,7 @@ pub mod sha256;
 pub mod slab_alloc;
 pub mod str_intern;
 pub mod str_util;
+pub mod subprocess;
 pub mod system_info;
 pub mod vmem;
 pub mod yaml;
