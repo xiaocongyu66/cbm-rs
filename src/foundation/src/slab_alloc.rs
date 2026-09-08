@@ -438,8 +438,13 @@ pub fn destroy_thread() {
 mod tests {
     use super::*;
 
+    /// Slab state spans the thread-local freelist and the
+    /// process-global page map; the C tests run in separate processes,
+    /// so the Rust port runs every scenario inside ONE test, in order,
+    /// with a reclaim between them.
     #[test]
-    fn small_alloc_roundtrip() {
+    fn slab_scenarios_in_sequence() {
+        // ── small_alloc_roundtrip ──
         unsafe {
             let a = test_malloc(32);
             assert!(!a.is_null());
@@ -450,39 +455,35 @@ mod tests {
             );
             test_free(a);
         }
-    }
+        TLS_SLAB.with(|tls| reclaim_pages_inner(&mut tls.borrow_mut()));
 
-    #[test]
-    fn zero_size_becomes_one() {
+        // ── zero_size_becomes_one ──
         unsafe {
             let p = test_malloc(0);
             assert!(!p.is_null());
             test_free(p);
         }
-    }
+        TLS_SLAB.with(|tls| reclaim_pages_inner(&mut tls.borrow_mut()));
 
-    #[test]
-    fn big_alloc_uses_heap() {
+        // ── big_alloc_uses_heap ──
         unsafe {
             let p = test_malloc(SLAB_CHUNK_SIZE * 4);
             assert!(!p.is_null());
             assert!(map_lookup(p as usize & SLAB_PAGE_MASK).is_null()); // not slab
             test_realloc(p, 0); // free via realloc(0)
         }
-    }
+        TLS_SLAB.with(|tls| reclaim_pages_inner(&mut tls.borrow_mut()));
 
-    #[test]
-    fn calloc_zeroes() {
+        // ── calloc_zeroes ──
         unsafe {
             let p = test_calloc(8, 8);
             assert!(!p.is_null());
             assert!((0..64).all(|i| *p.add(i) == 0));
             test_free(p);
         }
-    }
+        TLS_SLAB.with(|tls| reclaim_pages_inner(&mut tls.borrow_mut()));
 
-    #[test]
-    fn realloc_promotes() {
+        // ── realloc_promotes ──
         unsafe {
             let a = test_malloc(48); // slab
             assert!(!map_lookup(a as usize & SLAB_PAGE_MASK).is_null());
@@ -491,10 +492,9 @@ mod tests {
             assert!(map_lookup(b as usize & SLAB_PAGE_MASK).is_null());
             test_realloc(b, 0);
         }
-    }
+        TLS_SLAB.with(|tls| reclaim_pages_inner(&mut tls.borrow_mut()));
 
-    #[test]
-    fn many_chunks_spans_pages() {
+        // ── many_chunks_spans_pages ──
         unsafe {
             let n = SLAB_PAGE_CHUNKS * 2 + 10;
             let ptrs: Vec<*mut u8> = (0..n).map(|_| test_malloc(64)).collect();
@@ -504,10 +504,9 @@ mod tests {
             }
             reclaim();
         }
-    }
+        TLS_SLAB.with(|tls| reclaim_pages_inner(&mut tls.borrow_mut()));
 
-    #[test]
-    fn reclaim_then_reuse() {
+        // ── reclaim_then_reuse ──
         unsafe {
             let a = test_malloc(16);
             test_free(a);
@@ -517,5 +516,6 @@ mod tests {
             test_free(b);
             reclaim();
         }
+        TLS_SLAB.with(|tls| reclaim_pages_inner(&mut tls.borrow_mut()));
     }
 }
