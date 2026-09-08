@@ -119,6 +119,7 @@ pub fn threshold() -> usize {
     MIN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[allow(unused_variables)]
 fn capture(frames: &mut [usize; FRAMES], caller: Option<usize>) -> usize {
     #[cfg(all(not(test), not(target_env = "gnu")))]
     let _ = frames;
