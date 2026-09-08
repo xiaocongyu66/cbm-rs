@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["src/foundation"]
+
+[workspace.package]
+version = "0.10.8"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
