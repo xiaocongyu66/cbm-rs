@@ -7,3 +7,4 @@ description = "Rust rewrite of codebase-memory-mcp internal/cbm extraction engin
 
 [dependencies]
 cbm-foundation = { path = "../../src/foundation" }
+tree-sitter = { workspace = true }
