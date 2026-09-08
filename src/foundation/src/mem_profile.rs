@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 const FRAMES: usize = 8;
+#[cfg(not(test))]
 const SKIP_FRAMES: usize = 2;
 const SITES: usize = 4096;
 const POINTERS: usize = 262_144;
@@ -87,7 +88,7 @@ fn state() -> &'static Mutex<ProfileState> {
     })
 }
 
-/// Thread-local reentrancy guard (profiler runs inside the allocator).
+// Thread-local reentrancy guard (profiler runs inside the allocator).
 std::thread_local! {
     static REENTRANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -120,6 +121,8 @@ pub fn threshold() -> usize {
 
 fn capture(frames: &mut [usize; FRAMES], caller: Option<usize>) -> usize {
     #[cfg(not(test))]
+    let _ = caller;
+    #[cfg(not(test))]
     unsafe {
         let mut raw: [*mut libc::c_void; FRAMES + SKIP_FRAMES] =
             [std::ptr::null_mut(); FRAMES + SKIP_FRAMES];
@@ -131,11 +134,12 @@ fn capture(frames: &mut [usize; FRAMES], caller: Option<usize>) -> usize {
         for (i, slot) in frames.iter_mut().enumerate().take(count) {
             *slot = raw[i + SKIP_FRAMES] as usize;
         }
-        return count;
+        count
     }
     // Test builds have no malloc hook path; synthesize a stack from the caller.
     #[cfg(test)]
     {
+        let _ = caller;
         frames[0] = caller.unwrap_or(0x1000);
         for f in frames.iter_mut().skip(1) {
             *f = 0;
@@ -178,7 +182,7 @@ fn pointer_slot(block: usize) -> usize {
     // Mix high bits down: page-aligned addresses would collide.
     v ^= v >> 20;
     v = v.wrapping_mul(2654435761);
-    (v % POINTERS) as usize
+    v % POINTERS
 }
 
 /// Record an allocation of `size` bytes at `block`, attributed to the call
