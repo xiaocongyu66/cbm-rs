@@ -4,6 +4,9 @@
 //! crates; ts_runtime becomes the tree-sitter Rust runtime.
 
 pub mod lang_specs;
+pub mod minhash;
+pub mod ts;
+pub mod types;
 
 /// Language enum — 1:1 with C `CBMLanguage` (same order,
 /// `#[repr(u16)]` so the discriminant matches the C indices stored in

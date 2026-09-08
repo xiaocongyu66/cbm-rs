@@ -8,3 +8,6 @@ description = "Rust rewrite of codebase-memory-mcp internal/cbm extraction engin
 [dependencies]
 cbm-foundation = { path = "../../src/foundation" }
 tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-python = { workspace = true }
+xxhash-rust = { workspace = true }

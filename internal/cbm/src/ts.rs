@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn unsupported_language_is_none() {
         // A language whose grammar crate is not linked yet.
-        assert_eq!(parse(Language::HASKELL, "main = ()"), None);
+        assert!(parse(Language::HASKELL, "main = ()").is_none());
     }
 
     #[test]
