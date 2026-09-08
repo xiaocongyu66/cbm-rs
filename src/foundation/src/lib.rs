@@ -23,3 +23,4 @@ pub mod str_intern;
 pub mod str_util;
 pub mod system_info;
 pub mod vmem;
+pub mod yaml;
