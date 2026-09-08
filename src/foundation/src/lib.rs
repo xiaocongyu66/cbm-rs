@@ -5,4 +5,6 @@
 
 pub mod arena;
 pub mod constants;
+pub mod dyn_array;
+pub mod hash_table;
 pub mod limits;
