@@ -30,4 +30,5 @@ pub mod str_util;
 pub mod subprocess;
 pub mod system_info;
 pub mod vmem;
+pub mod workspace;
 pub mod yaml;
