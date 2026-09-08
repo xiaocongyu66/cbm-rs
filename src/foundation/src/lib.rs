@@ -19,6 +19,7 @@ pub mod platform;
 pub mod profile;
 pub mod secure_random;
 pub mod sha256;
+pub mod slab_alloc;
 pub mod str_intern;
 pub mod str_util;
 pub mod system_info;
