@@ -10,7 +10,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 const PAYLOAD_CAP: usize = 4096;
 const NAME_MAX: usize = 255;
@@ -132,7 +132,7 @@ impl LockDirectory {
             return false;
         };
         let euid = unsafe { geteuid() };
-        is_dir(&h)
+        let ok = is_dir(&h)
             && is_dir(&p)
             && h.st_dev == self.device
             && h.st_ino == self.inode
@@ -141,7 +141,15 @@ impl LockDirectory {
             && h.st_uid == euid
             && p.st_uid == euid
             && mode_bits(&h) == 0o700
-            && mode_bits(&p) == 0o700
+            && mode_bits(&p) == 0o700;
+        if !ok {
+            eprintln!(
+                "PFL reval: pid={} fd={} h_dir={} p_dir={} h_ino={} self_ino={} p_ino={} h_mode={:o} p_mode={:o} h_uid={} euid={}",
+                self.owner_pid, self.fd, is_dir(&h), is_dir(&p), h.st_ino, self.inode, p.st_ino,
+                mode_bits(&h), mode_bits(&p), h.st_uid, euid
+            );
+        }
+        ok
     }
 
     pub fn path(&self) -> &Path {
@@ -218,12 +226,80 @@ static TRACKED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Held across one lock operation; other threads WAIT (C pthread_mutex
 /// semantics — enter never spuriously fails inside one process).
 pub struct ForkGuard {
-    _guard: MutexGuard<'static, ()>,
+    guard: MutexGuard<'static, ()>,
 }
 
 pub fn fork_guard_enter() -> Option<ForkGuard> {
     let guard = FORK_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    Some(ForkGuard { _guard: guard })
+    Some(ForkGuard { guard })
+}
+
+/// Fork condition (C cbm_private_fork_condition_t): a Condvar associated
+/// with the global fork guard's mutex. Waiting releases the guard; wake-up
+/// re-acquires it. Clock: Rust wait_timeout uses the monotonic clock,
+/// matching the C's pthread_condattr_setclock(CLOCK_MONOTONIC).
+pub struct ForkCondition {
+    cv: Condvar,
+}
+
+pub fn fork_condition_new() -> ForkCondition {
+    ForkCondition { cv: Condvar::new() }
+}
+
+/// Broadcast while holding the guard (C
+/// cbm_private_fork_condition_broadcast_while_guarded).
+pub fn fork_condition_broadcast_while_guarded(condition: &ForkCondition) {
+    condition.cv.notify_all();
+}
+
+/// Wait until `deadline_ms` (monotonic) or a broadcast, releasing the guard
+/// for the wait (C cbm_private_fork_condition_wait_until_while_guarded).
+/// Returns the re-acquired guard plus the wait outcome.
+pub fn fork_condition_wait_until_while_guarded(
+    condition: &ForkCondition,
+    guard: ForkGuard,
+    deadline_ms: u64,
+) -> (ForkGuard, crate::private_file_lock::ForkWaitStatus) {
+    let remaining = if deadline_ms == u64::MAX {
+        None
+    } else {
+        let now = crate::platform::now_ms();
+        if now >= deadline_ms {
+            return (guard, crate::private_file_lock::ForkWaitStatus::Timeout);
+        }
+        Some(std::time::Duration::from_millis(deadline_ms - now))
+    };
+    match remaining {
+        None => {
+            let g = condition
+                .cv
+                .wait(guard.guard)
+                .unwrap_or_else(|e| e.into_inner());
+            (
+                ForkGuard { guard: g },
+                crate::private_file_lock::ForkWaitStatus::Signaled,
+            )
+        }
+        Some(d) => {
+            let (g, res) = condition
+                .cv
+                .wait_timeout(guard.guard, d)
+                .unwrap_or_else(|e| e.into_inner());
+            let status = if res.timed_out() {
+                crate::private_file_lock::ForkWaitStatus::Timeout
+            } else {
+                crate::private_file_lock::ForkWaitStatus::Signaled
+            };
+            (ForkGuard { guard: g }, status)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkWaitStatus {
+    Signaled,
+    Timeout,
+    Error,
 }
 
 /// After fork(): the child inherits NO tracked locks (they belong to the

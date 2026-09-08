@@ -13,6 +13,7 @@ pub mod dump_verify;
 pub mod dyn_array;
 pub mod hash_table;
 pub mod limits;
+pub mod lock_registry;
 pub mod log;
 pub mod macos_acl;
 pub mod mem;
