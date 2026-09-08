@@ -111,7 +111,7 @@ impl ScaleProbe {
         if self.total < SCALE_MIN_ITEMS {
             return;
         }
-        let mut cp = self.next_cp.load(Ordering::Relaxed);
+        let cp = self.next_cp.load(Ordering::Relaxed);
         if cp >= SCALE_CHECKPOINTS as i32 {
             return;
         }
