@@ -14,6 +14,7 @@ pub mod dyn_array;
 pub mod hash_table;
 pub mod limits;
 pub mod log;
+pub mod mem;
 pub mod mem_profile;
 pub mod platform;
 pub mod profile;
