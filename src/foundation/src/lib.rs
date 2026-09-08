@@ -4,6 +4,10 @@
 //! deleted once the Rust version and its tests land.
 
 pub mod arena;
+pub mod compat;
+pub mod compat_fs;
+pub mod compat_regex;
+pub mod compat_thread;
 pub mod constants;
 pub mod dyn_array;
 pub mod hash_table;

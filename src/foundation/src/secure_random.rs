@@ -36,10 +36,7 @@ fn getrandom_fill(buffer: &mut [u8]) -> Result<(), i32> {
             Err(_) => Err(-1),
         },
     };
-    let file = match file {
-        Ok(f) => f,
-        Err(e) => return Err(e),
-    };
+    let file = file?;
     let mut reader = file;
     match reader.read_exact(buffer) {
         Ok(()) => Ok(()),
