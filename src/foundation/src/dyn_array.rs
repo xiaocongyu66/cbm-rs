@@ -28,7 +28,7 @@ mod tests {
         for x in [42, 99] {
             nums.push(x); // cbm_da_push
         }
-        let out: Vec<i32> = nums.iter().copied().collect();
+        let out: Vec<i32> = nums.to_vec();
         assert_eq!(out, vec![42, 99]);
         // cbm_da_free is implicit in drop.
     }
