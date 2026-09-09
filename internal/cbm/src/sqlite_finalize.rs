@@ -9,10 +9,17 @@
 
 use std::fs::File;
 
-use crate::page_builder::PageBuilder;
+use crate::page_builder::{write_empty_leaf_page, PageBuilder};
 use crate::sqlite_writer::{
-    build_project_record, put_u16, put_u32, CBM_PAGE_SIZE, FIRST_DATA_PAGE, FIRST_ROWID,
+    build_project_record, build_table_cell, put_u16, put_u32, skip_pending_byte, BTREE_HEADER_SIZE,
+    CBM_PAGE_SIZE, CELL_PTR_SIZE, FIRST_DATA_PAGE, FIRST_ROWID, SQLITE_HEADER_SIZE,
 };
+
+const HDR_FREEBLOCK_OFF: usize = 1;
+const HDR_CELLCOUNT_OFF: usize = 3;
+const HDR_CONTENT_OFF: usize = 5;
+const HDR_FRAGBYTES_OFF: usize = 7;
+const LEAF_TABLE_FLAG: u8 = 0x0D;
 
 // ── File header constants (C HDR_OFF_* / defines) ───────────────
 
@@ -65,9 +72,10 @@ pub const SCHEMA_SQL_IDX_EDGES_SOURCE_TYPE: &str =
     "CREATE INDEX idx_edges_source_type ON edges(project, source_id, type)";
 pub const SCHEMA_SQL_IDX_EDGES_URL_PATH: &str =
     "CREATE INDEX idx_edges_url_path ON edges(project, url_path_gen)";
-pub const SCHEMA_SQL_PROJECT_SUMMARIES: &str = "CREATE TABLE project_summaries (\n\t\t\tproject TEXT PRIMARY KEY,\n\t\t\tsummary TEXT NOT NULL\n\t\t)";
-pub const SCHEMA_SQL_NODE_VECTORS: &str = "CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tvector BLOB NOT NULL\n\t)";
-pub const SCHEMA_SQL_TOKEN_VECTORS: &str = "CREATE TABLE token_vectors (\n\t\tid INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\ttoken TEXT NOT NULL,\n\t\tvector BLOB NOT NULL,\n\t\tidf INTEGER NOT NULL\n\t)";
+pub const SCHEMA_SQL_PROJECT_SUMMARIES: &str = "CREATE TABLE project_summaries (\n\t\t\tproject TEXT PRIMARY KEY,\n\t\t\tsummary TEXT NOT NULL,\n\t\t\tsource_hash TEXT NOT NULL,\n\t\t\tcreated_at TEXT NOT NULL,\n\t\t\tupdated_at TEXT NOT NULL\n\t\t)";
+pub const SCHEMA_SQL_NODE_VECTORS: &str = "CREATE TABLE node_vectors (\n\t\tnode_id INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\tvector BLOB NOT NULL\n\t)";
+pub const SCHEMA_SQL_TOKEN_VECTORS: &str = "CREATE TABLE token_vectors (\n\t\tid INTEGER PRIMARY KEY,\n\t\tproject TEXT NOT NULL,\n\t\ttoken TEXT NOT NULL,\n\t\tvector BLOB NOT NULL,\n\t\tidf INTEGER NOT NULL\n\t)";
+pub const SCHEMA_SQL_SQLITE_SEQUENCE: &str = "CREATE TABLE sqlite_sequence(name,seq)";
 
 /// sqlite_master entry (C MasterEntry).
 #[derive(Debug, Clone)]
@@ -144,12 +152,12 @@ pub struct FinalizeCtx<'a> {
 pub fn write_metadata_tables(ctx: &mut FinalizeCtx<'_>) -> std::io::Result<(u32, u32, u32, u32)> {
     // projects: single row.
     let proj_rec = build_project_record(ctx.project, ctx.indexed_at, ctx.root_path);
-    let projects_root = write_empty_ok_table(ctx.file, ctx.next_page, &[(&[1], &proj_rec)])?;
+    let projects_root = write_table_btree_multi(ctx.file, ctx.next_page, &[&proj_rec], &[1])?;
 
-    // file_hashes / project_summaries: empty tables → root 0 from the C
-    // (write_table_btree with count 0 returns 0 and allocates nothing).
-    let file_hashes_root = 0;
-    let summaries_root = 0;
+    // file_hashes / project_summaries: empty tables still allocate one
+    // empty leaf page each (C write_table_btree count==0 branch).
+    let file_hashes_root = write_table_btree_multi(ctx.file, ctx.next_page, &[], &[])?;
+    let summaries_root = write_table_btree_multi(ctx.file, ctx.next_page, &[], &[])?;
 
     // sqlite_sequence: (name, seq) rows for nodes and edges — the C uses
     // rowids {1, 2} (FIRST_ROWID, FIRST_DATA_PAGE).
@@ -173,8 +181,8 @@ pub fn write_metadata_tables(ctx: &mut FinalizeCtx<'_>) -> std::io::Result<(u32,
     ))
 }
 
-/// Write a table B-tree from records; empty input → root 0, no allocation
-/// (C write_table_btree with count 0).
+/// Write a table B-tree from records; empty input allocates a single
+/// empty leaf page (C write_table_btree count==0 branch — NOT root 0).
 pub fn write_table_btree_multi(
     file: &mut File,
     next_page: &mut u32,
@@ -182,7 +190,11 @@ pub fn write_table_btree_multi(
     rowids: &[i64],
 ) -> std::io::Result<u32> {
     if records.is_empty() {
-        return Ok(0);
+        *next_page = skip_pending_byte(*next_page);
+        let pnum = *next_page;
+        *next_page += 1;
+        write_empty_leaf_page(file, pnum, false)?;
+        return Ok(pnum);
     }
     let mut pb = PageBuilder::open(file, *next_page)?;
     for (i, rec) in records.iter().enumerate() {
@@ -197,76 +209,46 @@ pub fn write_table_btree_multi(
     Ok(root)
 }
 
-/// Convenience: single-record table (projects row).
-fn write_empty_ok_table(
-    file: &mut File,
-    next_page: &mut u32,
-    rows: &[(&[i64], &[u8])],
-) -> std::io::Result<u32> {
-    let records: Vec<&[u8]> = rows.iter().map(|(_, r)| *r).collect();
-    let rowids: Vec<i64> = rows.iter().map(|(r, _)| r[0]).collect();
-    write_table_btree_multi(file, next_page, &records, &rowids)
-}
-
-/// Assemble sqlite_master cells in the C's ordering (table → autoindex →
-/// user indexes per table) and write the page-1 master B-tree + file
-/// header. Returns the complete page-1 bytes (C write_master_page1 +
-/// write_sqlite_file_header).
+/// Assemble the page-1 sqlite_master B-tree in the C's ordering (table →
+/// autoindex → user indexes per table) plus the file header, built
+/// directly in memory exactly like the C (which writes the page with an
+/// in-place cell layout rather than going through PageBuilder — the master
+/// must fit one page or the C fails with ERR_MASTER_OVERFLOW). Returns the
+/// complete page-1 bytes for the caller to write at file offset 0
+/// (C write_master_page1 + write_sqlite_file_header).
 ///
-/// `master` entries must already carry correct root pages. Page 1 itself
-/// is always page 1 of the file (its B-tree header sits after the 100-byte
-/// SQLite header); its rowids are 1..N.
+/// `master` entries must already carry correct root pages; rowids are
+/// 1..N; the header DB-size field is `next_page - 1` (pages are 1-based).
 pub fn write_master_page1(master: &[MasterEntry], next_page: u32) -> std::io::Result<Vec<u8>> {
-    let mut records: Vec<Vec<u8>> = Vec::with_capacity(master.len());
-    let mut rowids: Vec<i64> = Vec::with_capacity(master.len());
-    for (i, e) in master.iter().enumerate() {
-        rowids.push(i as i64 + 1);
-        records.push(build_master_record(e));
-    }
-    // Build the master table into a temp page builder; it typically fits a
-    // single leaf (page 1 itself).
-    let tmp_path = std::env::temp_dir().join(format!(
-        "cbm-master-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
-    let mut pb = PageBuilder::open(&mut f, 1)?; // page 1 carries the header
-    for (i, rec) in records.iter().enumerate() {
-        pb.add_table_cell_with_flush(
-            rowids[i],
-            rec,
-            rowids.get(i.wrapping_sub(1)).copied().unwrap_or(0),
-        )?;
-    }
-    let (root, _) = pb.finalize_table(rowids[rowids.len() - 1])?;
-    drop(f);
-    // Read back page 1 bytes (the master leaf itself) and splice the file
-    // header in.
-    let mut page1 = std::fs::read(&tmp_path)?;
-    page1.truncate(CBM_PAGE_SIZE as usize);
-    let mut header_page = vec![0u8; CBM_PAGE_SIZE as usize];
-    header_page.copy_from_slice(&page1[..CBM_PAGE_SIZE as usize]);
-    write_sqlite_file_header(&mut header_page, next_page);
-    let _ = root;
-    std::fs::remove_file(&tmp_path).ok();
-    Ok(header_page)
-}
+    let mut page1 = vec![0u8; CBM_PAGE_SIZE as usize];
+    let hdr = SQLITE_HEADER_SIZE;
+    page1[hdr] = LEAF_TABLE_FLAG;
+    let mut content_off = CBM_PAGE_SIZE as usize;
+    let mut ptr_off = hdr + BTREE_HEADER_SIZE;
 
-/// Node/edge index cells are sorted + built by dedicated index B-trees in
-/// the C; part-1 of finalize writes only the nodes table and metadata.
-/// This helper computes the (root, next) pair for an EMPTY table — the C
-/// returns root 0 and allocates no page.
-pub fn empty_table_root() -> u32 {
-    0
+    for (i, e) in master.iter().enumerate() {
+        let rec = build_master_record(e);
+        let cell = build_table_cell(i as i64 + 1, &rec);
+        let available = content_off - ptr_off - CELL_PTR_SIZE;
+        if cell.len() > available {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "master overflow",
+            ));
+        }
+        content_off -= cell.len();
+        page1[content_off..content_off + cell.len()].copy_from_slice(&cell);
+        put_u16(&mut page1[ptr_off..], content_off as u16);
+        ptr_off += CELL_PTR_SIZE;
+    }
+
+    put_u16(&mut page1[hdr + HDR_FREEBLOCK_OFF..], 0);
+    put_u16(&mut page1[hdr + HDR_CELLCOUNT_OFF..], master.len() as u16);
+    put_u16(&mut page1[hdr + HDR_CONTENT_OFF..], content_off as u16);
+    page1[hdr + HDR_FRAGBYTES_OFF] = 0;
+
+    write_sqlite_file_header(&mut page1, next_page - 1);
+    Ok(page1)
 }
 
 #[cfg(test)]
@@ -333,9 +315,10 @@ mod tests {
         };
         let (projects, file_hashes, summaries, seq) = write_metadata_tables(&mut ctx).unwrap();
         assert!(projects >= 2);
-        assert_eq!(file_hashes, 0); // empty → root 0, no page
-        assert_eq!(summaries, 0);
-        assert!(seq > projects);
+        // Empty tables still allocate one empty leaf page each (C parity).
+        assert!(file_hashes > projects);
+        assert!(summaries > file_hashes);
+        assert!(seq > summaries);
         std::fs::remove_file(&path).ok();
     }
 
