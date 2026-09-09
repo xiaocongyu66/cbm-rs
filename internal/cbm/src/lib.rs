@@ -17,6 +17,7 @@ pub mod fqn;
 pub mod helpers;
 pub mod lang_specs;
 pub mod lz4_store;
+pub mod macro_table;
 pub mod minhash;
 pub mod page_builder;
 pub mod sqlite_finalize;
