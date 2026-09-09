@@ -51,6 +51,9 @@ fn resolve_grammar(crate_name: &str) -> Option<tree_sitter::Language> {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "jinja2" => Some(tree_sitter_jinja2::LANGUAGE.into()),
         "yaml" => Some(tree_sitter_yaml::LANGUAGE.into()),
+        "c-sharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        "elixir" => Some(tree_sitter_elixir::LANGUAGE.into()),
+        "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
         _ => None,
     }
 }

@@ -6,6 +6,7 @@
 pub mod ac;
 pub mod ast_profile;
 pub mod extract_calls;
+pub mod extract_channels;
 pub mod extract_dbt;
 pub mod extract_defs;
 pub mod extract_env_accesses;
