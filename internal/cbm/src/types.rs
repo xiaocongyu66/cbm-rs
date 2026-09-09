@@ -190,6 +190,19 @@ pub struct Throw {
     pub enclosing_func_qn: String,
 }
 
+/// A read/write record (C CBMReadWrite).
+#[derive(Debug, Clone, Default)]
+pub struct ReadWrite {
+    pub var_name: String,
+    pub enclosing_func_qn: String,
+    /// true = write, false = read.
+    pub is_write: bool,
+    /// var_name is the field half of a selector/member LHS (`t.err = x` →
+    /// "err"); the receiver is stripped here, so this is the only record of
+    /// selector shape (#1962).
+    pub is_member_access: bool,
+}
+
 /// A referenced type (C CBMTypeRef).
 #[derive(Debug, Clone, Default)]
 pub struct TypeRef {
@@ -320,6 +333,8 @@ pub struct FileResult {
     pub imports: Vec<Import>,
     pub usages: Vec<Usage>,
     pub throws: Vec<Throw>,
+    /// Read/write records (C CBMRWArray rw).
+    pub rw: Vec<ReadWrite>,
     pub env_accesses: Vec<EnvAccess>,
     pub type_assigns: Vec<TypeAssign>,
     pub type_refs: Vec<TypeRef>,
