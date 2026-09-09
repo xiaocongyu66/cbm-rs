@@ -11,7 +11,7 @@ use crate::extract_env_accesses::ExtractCtx;
 use crate::helpers;
 use crate::lang_specs::LanguageSpec;
 use crate::minhash;
-use crate::types::{Definition, SourceOrigin};
+use crate::types::Definition;
 use crate::Language;
 use std::collections::HashSet;
 
@@ -911,12 +911,12 @@ pub fn extract_variables(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
             def.qualified_name = crate::fqn::fqn_compute_source_lang(
                 ctx.project,
                 ctx.rel_path,
-                Some(&name),
+                Some(name),
                 ctx.language,
             );
             def.start_line = d.start_position().row as u32 + 1;
             def.end_line = d.end_position().row as u32 + 1;
-            def.is_exported = helpers::is_exported(&name, ctx.language);
+            def.is_exported = helpers::is_exported(name, ctx.language);
             ctx.result.definitions.push(def);
         }
     }
@@ -990,7 +990,7 @@ fn extract_class_def_shallow(
         return;
     }
     let qn =
-        crate::fqn::fqn_compute_source_lang(ctx.project, ctx.rel_path, Some(&name), ctx.language);
+        crate::fqn::fqn_compute_source_lang(ctx.project, ctx.rel_path, Some(name), ctx.language);
     let mut def = Definition {
         name: name.to_string(),
         qualified_name: qn.clone(),
@@ -1059,7 +1059,6 @@ mod tests {
 
     #[test]
     fn complexity_counts_branches_and_loops() {
-        let tree = crate::ts::parse(Language::PYTHON, "def f():\n    pass\n").unwrap();
         let src = r#"
 def work(items, flag):
     for item in items:
