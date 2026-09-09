@@ -178,7 +178,11 @@ fn enclosing_function_qn(node: Node<'_>, source: &str) -> String {
 
 /// Channel name from the first argument of a call: literal first, then
 /// identifier resolution via the constant table (C extract_channel_name).
-fn extract_channel_name(args: Node<'_>, consts: Option<&ConstTable>, source: &str) -> Option<String> {
+fn extract_channel_name(
+    args: Node<'_>,
+    consts: Option<&ConstTable>,
+    source: &str,
+) -> Option<String> {
     let first = args.named_child(0)?;
     let name = literal_from_arg(first, source)
         .or_else(|| literal_from_first_child(first, source))
