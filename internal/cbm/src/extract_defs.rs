@@ -953,7 +953,7 @@ pub fn walk_defs(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
                     continue;
                 }
             } else if !spec.class_node_types.is_empty() && spec.class_node_types.contains(&kind) {
-                extract_class_def_shallow(ctx, node, spec);
+                extract_class_def(ctx, node, spec);
                 stack.pop();
                 continue;
             }
@@ -974,60 +974,442 @@ pub fn walk_defs(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
     }
 }
 
-/// Class extraction, part-1 shallow shape: the class node itself plus its
-/// `name`-field methods (extract_class_methods comes with part 2's
-/// class-body traversal).
-fn extract_class_def_shallow(
+// ── Class extraction (C extract_class_def, part 2) ──────────────
+
+/// Class label by node kind (C class_label_for_kind): interface/enum/type
+/// variants; GO type_spec label refinement (interface_type/struct_type).
+fn class_label_for(kind: &str, node: tree_sitter::Node<'_>, lang: Language) -> &'static str {
+    if matches!(
+        kind,
+        "interface_declaration"
+            | "interface_type"
+            | "trait_item"
+            | "trait_definition"
+            | "protocol_declaration"
+    ) {
+        return "Interface";
+    }
+    if matches!(kind, "enum_specifier" | "enum_declaration" | "enum_item") {
+        return "Enum";
+    }
+    if matches!(
+        kind,
+        "type_alias_declaration" | "type_item" | "type_alias" | "type_definition"
+    ) {
+        return "Type";
+    }
+    if lang == Language::GO && kind == "type_spec" {
+        if let Some(t) = node.child_by_field_name("type") {
+            return match t.kind() {
+                "interface_type" => "Interface",
+                "struct_type" => "Struct",
+                _ => "Class",
+            };
+        }
+    }
+    "Class"
+}
+
+/// JS/TS bases (C extract_ts_bases + collect_ts_bases): extends_clause value
+/// / implements_clause / extends_type_clause named children; generic_type
+/// unwraps to its `name`; strip `<...>` args and a leading backslash.
+fn collect_ts_bases(clause: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    match clause.kind() {
+        "extends_clause" => {
+            if let Some(v) = clause.child_by_field_name("value") {
+                push_base_text(v, source, out);
+            }
+        }
+        "implements_clause" | "extends_type_clause" => {
+            for i in 0..clause.named_child_count() {
+                let c = clause.named_child(i).unwrap();
+                if c.kind() == "type_arguments" {
+                    continue;
+                }
+                if c.kind() == "generic_type" {
+                    if let Some(nm) = c.child_by_field_name("name") {
+                        push_base_text(nm, source, out);
+                        continue;
+                    }
+                }
+                push_base_text(c, source, out);
+            }
+        }
+        _ => {
+            push_base_text(clause, source, out);
+        }
+    }
+}
+
+fn push_base_text(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<String>) {
+    let mut t = crate::fqn::node_text(node, source).to_string();
+    if let Some(angle) = t.find('<') {
+        t.truncate(angle);
+    }
+    if let Some(bs) = t.rfind('\\') {
+        t = t[bs + 1..].to_string();
+    }
+    // Anonymous keyword tokens ("extends"/"implements") under class_heritage
+    // carry no base name — skip them (their named siblings carry the types).
+    if matches!(t.as_str(), "extends" | "implements") {
+        return;
+    }
+    if !t.is_empty() {
+        out.push(t);
+    }
+}
+
+/// Base-class extraction (C extract_base_classes, part-1 languages: JS/TS
+/// class_heritage + Java/Kotlin superclass field).
+fn extract_base_classes(node: tree_sitter::Node<'_>, source: &str, lang: Language) -> Vec<String> {
+    let mut out = Vec::new();
+    if matches!(
+        lang,
+        Language::JAVASCRIPT | Language::TYPESCRIPT | Language::TSX | Language::ARKTS
+    ) {
+        for i in 0..node.child_count() {
+            let child = node.child(i).unwrap();
+            match child.kind() {
+                "class_heritage" => {
+                    for j in 0..child.child_count() {
+                        if let Some(c) = child.child(j) {
+                            collect_ts_bases(c, source, &mut out);
+                        }
+                    }
+                }
+                "extends_type_clause" => collect_ts_bases(child, source, &mut out),
+                _ => {}
+            }
+        }
+        return out;
+    }
+    // Java/Kotlin/Python: superclass field (Java), superclasses / argument
+    // list (Kotlin), argument_list (Python bases).
+    if let Some(sc) = node
+        .child_by_field_name("superclass")
+        .or_else(|| crate::fqn::find_child_by_kind(node, "superclass"))
+        .or_else(|| crate::fqn::find_child_by_kind(node, "superinterfaces"))
+    {
+        for i in 0..sc.named_child_count() {
+            let b = sc.named_child(i).unwrap();
+            if matches!(b.kind(), "type_identifier" | "identifier" | "superclass") {
+                out.push(crate::fqn::node_text(b, source).to_string());
+            }
+        }
+        // Python: bases are plain identifiers under argument_list; the
+        // superclass container itself may have no named children.
+        if out.is_empty() {
+            let t = crate::fqn::node_text(sc, source);
+            for part in t.split(',') {
+                let p = part.trim();
+                if !p.is_empty() {
+                    out.push(p.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Enum-member node kinds (C is_enum_member_kind).
+fn is_enum_member_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "enum_member_declaration"
+            | "enum_constant"
+            | "enum_member"
+            | "enum_assignment"
+            | "enumerator"
+    )
+}
+
+/// Class-member body lookup (C find_class_body): body / members / class_body
+/// / declaration_list fields; GO's type field.
+fn find_class_body<'t>(
+    class_node: tree_sitter::Node<'t>,
+    lang: Language,
+) -> Option<tree_sitter::Node<'t>> {
+    for f in ["body", "members", "class_body", "declaration_list"] {
+        if let Some(body) = class_node.child_by_field_name(f) {
+            return Some(body);
+        }
+    }
+    if lang == Language::GO {
+        if let Some(t) = class_node.child_by_field_name("type") {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Java enum_body → enum_body_declarations normalization
+/// (C find_class_member_body).
+fn find_class_member_body<'t>(
+    class_node: tree_sitter::Node<'t>,
+    lang: Language,
+) -> Option<tree_sitter::Node<'t>> {
+    let body = find_class_body(class_node, lang)?;
+    if lang == Language::JAVA && body.kind() == "enum_body" {
+        return crate::fqn::find_child_by_kind(body, "enum_body_declarations").or(Some(body));
+    }
+    Some(body)
+}
+
+/// Method definition emission (C push_method_def).
+fn push_method_def(
     ctx: &mut ExtractCtx<'_>,
-    node: tree_sitter::Node<'_>,
-    _spec: &LanguageSpec,
+    child: tree_sitter::Node<'_>,
+    class_qn: &str,
+    name_node: tree_sitter::Node<'_>,
+    spec: &LanguageSpec,
 ) {
-    let Some(name_node) = node.child_by_field_name("name") else {
+    let name = crate::fqn::normalize_name_node_text(name_node, ctx.source, ctx.language);
+    if name.is_empty() {
+        return;
+    }
+    let mut def = Definition {
+        name: name.clone(),
+        qualified_name: format!("{class_qn}.{name}"),
+        label: "Method".to_string(),
+        file_path: ctx.rel_path.to_string(),
+        parent_class: Some(class_qn.to_string()),
+        ..Default::default()
+    };
+    def.start_line = child.start_position().row as u32 + 1;
+    def.end_line = child.end_position().row as u32 + 1;
+    def.lines = (def.end_line - def.start_line + 1) as i32;
+    def.is_exported = helpers::is_exported(&name, ctx.language);
+    if ctx.language == Language::RUST && child.kind() == "function_signature_item" {
+        def.is_abstract = true;
+    }
+    if let Some(params) = find_function_params(child, ctx.language) {
+        def.signature = Some(crate::fqn::node_text(params, ctx.source).to_string());
+        // Param types (names come from the def walk's param capture).
+        for i in 0..params.named_child_count() {
+            let Some(c) = params.named_child(i) else {
+                continue;
+            };
+            if let Some(t) = c.child_by_field_name("type") {
+                def.param_types
+                    .push(crate::fqn::node_text(t, ctx.source).to_string());
+            }
+        }
+    }
+    for f in ["result", "return_type", "type"] {
+        if let Some(rt) = child.child_by_field_name(f) {
+            def.return_type = Some(crate::fqn::node_text(rt, ctx.source).to_string());
+            break;
+        }
+    }
+    def.docstring = extract_docstring(child, ctx.source, ctx.language);
+    if !spec.branching_node_types.is_empty() {
+        let mut cx = Complexity::default();
+        compute_complexity(child, spec.branching_node_types, &mut cx);
+        def.complexity = cx.cyclomatic;
+        def.cognitive = cx.cognitive;
+        def.loop_count = cx.loop_count;
+        def.loop_depth = cx.loop_depth;
+        def.max_access_depth = cx.max_access_depth;
+    }
+    def.body_tokens = extract_body_ident_tokens(child, ctx.source);
+    def.is_test = def.is_test || ctx.result.is_test_file;
+    ctx.result.definitions.push(def);
+}
+
+/// Methods inside a class body (C extract_class_methods, part-1 languages):
+/// decorated_definition unwrap (Python), public_field_definition arrow
+/// methods (TS/JS React handlers), direct function kinds.
+fn extract_class_methods(
+    ctx: &mut ExtractCtx<'_>,
+    class_node: tree_sitter::Node<'_>,
+    class_qn: &str,
+    spec: &LanguageSpec,
+) {
+    let Some(body) = find_class_member_body(class_node, ctx.language) else {
+        return;
+    };
+    for i in 0..body.child_count() {
+        let Some(mut child) = body.child(i) else {
+            continue;
+        };
+        // Python wraps @classmethod/@staticmethod/@property in
+        // decorated_definition — peek to the inner definition.
+        if child.kind() == "decorated_definition" {
+            let Some(def) = child.child_by_field_name("definition") else {
+                continue;
+            };
+            if !spec.function_node_types.contains(&def.kind()) {
+                continue;
+            }
+            child = def;
+        }
+        // TS class-field arrow: `public_field_definition` (TS grammar) /
+        // `field_definition` (JS grammar) whose value is an arrow function.
+        // The field name is the `name` field (TS) or the first
+        // property_identifier child (JS).
+        if matches!(child.kind(), "public_field_definition" | "field_definition") {
+            let Some(value) = child.child_by_field_name("value") else {
+                continue;
+            };
+            if !spec.function_node_types.contains(&value.kind()) {
+                continue;
+            }
+            let fname = child
+                .child_by_field_name("name")
+                .or_else(|| crate::fqn::find_child_by_kind(child, "property_identifier"));
+            let Some(fname) = fname else {
+                continue;
+            };
+            push_method_def(ctx, value, class_qn, fname, spec);
+            continue;
+        }
+        if spec.function_node_types.contains(&child.kind()) {
+            // Rust: impl methods resolve via their own `name` field.
+            let Some(name_node) = resolve_func_name(child, ctx.language) else {
+                continue;
+            };
+            push_method_def(ctx, child, class_qn, name_node, spec);
+        }
+    }
+}
+
+/// Typed class fields (C extract_class_fields, part-1 languages): body
+/// children matching field_node_types with a `type` field.
+fn extract_class_fields(
+    ctx: &mut ExtractCtx<'_>,
+    class_node: tree_sitter::Node<'_>,
+    class_qn: &str,
+    spec: &LanguageSpec,
+) {
+    if spec.field_node_types.is_empty() {
+        return;
+    }
+    let Some(body) = find_class_member_body(class_node, ctx.language) else {
+        return;
+    };
+    for i in 0..body.named_child_count() {
+        let Some(child) = body.named_child(i) else {
+            continue;
+        };
+        if !spec.field_node_types.contains(&child.kind()) {
+            continue;
+        }
+        // Field name: `name` field, else a variable_declarator's identifier
+        // (Java field_declaration → variable_declarator → identifier), else
+        // the first identifier child.
+        let name = child
+            .child_by_field_name("name")
+            .map(|n| crate::fqn::node_text(n, ctx.source).to_string())
+            .or_else(|| {
+                crate::fqn::find_child_by_kind(child, "variable_declarator").and_then(|vd| {
+                    vd.child_by_field_name("name")
+                        .map(|n| crate::fqn::node_text(n, ctx.source).to_string())
+                })
+            })
+            .or_else(|| {
+                crate::fqn::find_child_by_kind(child, "identifier")
+                    .map(|n| crate::fqn::node_text(n, ctx.source).to_string())
+            });
+        let Some(name) = name else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let mut pdef = Definition {
+            name: name.clone(),
+            qualified_name: format!("{class_qn}.{name}"),
+            label: "Field".to_string(),
+            file_path: ctx.rel_path.to_string(),
+            parent_class: Some(class_qn.to_string()),
+            ..Default::default()
+        };
+        pdef.start_line = child.start_position().row as u32 + 1;
+        pdef.end_line = child.end_position().row as u32 + 1;
+        if let Some(t) = child.child_by_field_name("type") {
+            pdef.return_type = Some(crate::fqn::node_text(t, ctx.source).to_string());
+        }
+        ctx.result.definitions.push(pdef);
+    }
+}
+
+/// Enum members as Variable nodes (C extract_enum_members).
+fn extract_enum_members(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>, class_qn: &str) {
+    let Some(body) = find_class_body(node, ctx.language) else {
+        eprintln!("DBG enum: no body");
+        return;
+    };
+    eprintln!(
+        "DBG enum body={:?} members={}",
+        body.kind(),
+        body.named_child_count()
+    );
+    for mi in 0..body.named_child_count() {
+        let Some(member) = body.named_child(mi) else {
+            continue;
+        };
+        if !is_enum_member_kind(member.kind()) {
+            continue;
+        }
+        let mname = member
+            .child_by_field_name("name")
+            .or_else(|| crate::fqn::find_child_by_kind(member, "identifier"));
+        let Some(mname) = mname else {
+            continue;
+        };
+        let member_name = crate::fqn::node_text(mname, ctx.source);
+        if member_name.is_empty() {
+            continue;
+        }
+        ctx.result.definitions.push(Definition {
+            name: member_name.to_string(),
+            qualified_name: format!("{class_qn}.{member_name}"),
+            label: "Variable".to_string(),
+            file_path: ctx.rel_path.to_string(),
+            start_line: member.start_position().row as u32 + 1,
+            end_line: member.end_position().row as u32 + 1,
+            ..Default::default()
+        });
+    }
+}
+
+/// Class extraction (C extract_class_def, part-2 shape): label refinement,
+/// bases, enum members, methods, fields.
+fn extract_class_def(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>, spec: &LanguageSpec) {
+    let kind = node.kind();
+    let Some(name_node) = node
+        .child_by_field_name("name")
+        .or_else(|| crate::fqn::find_child_by_kind(node, "type_identifier"))
+    else {
         return;
     };
     let name = crate::fqn::node_text(name_node, ctx.source);
     if name.is_empty() {
         return;
     }
-    let qn =
+    let label = class_label_for(kind, node, ctx.language);
+    let class_qn =
         crate::fqn::fqn_compute_source_lang(ctx.project, ctx.rel_path, Some(name), ctx.language);
+    let name_owned = name.to_string();
     let mut def = Definition {
-        name: name.to_string(),
-        qualified_name: qn.clone(),
-        label: "Class".to_string(),
+        name: name_owned,
+        qualified_name: class_qn.clone(),
+        label: label.to_string(),
         file_path: ctx.rel_path.to_string(),
         ..Default::default()
     };
     def.start_line = node.start_position().row as u32 + 1;
     def.end_line = node.end_position().row as u32 + 1;
-    // Base classes：JS 的 extends 在 `class_heritage` 命名子节点（无字段名），
-    // Java/TS 的 `superclass` 有字段。两者都扫。
-    let bases = node
-        .child_by_field_name("superclass")
-        .or_else(|| crate::fqn::find_child_by_kind(node, "class_heritage"));
-    if let Some(bases) = bases {
-        let push = |n: tree_sitter::Node<'_>, def: &mut Definition| {
-            if matches!(
-                n.kind(),
-                "type_identifier" | "identifier" | "class" | "superclass" | "member_expression"
-            ) {
-                def.base_classes
-                    .push(crate::fqn::node_text(n, ctx.source).to_string());
-            }
-        };
-        push(bases, &mut def);
-        for i in 0..bases.named_child_count() {
-            if let Some(b) = bases.named_child(i) {
-                push(b, &mut def);
-            }
-        }
-    }
+    def.lines = (def.end_line - def.start_line + 1) as i32;
+    def.is_exported = helpers::is_exported(name, ctx.language);
+    def.base_classes = extract_base_classes(node, ctx.source, ctx.language);
     def.docstring = extract_docstring(node, ctx.source, ctx.language);
-    let mut cx = Complexity::default();
-    if let Some(body) = node.child_by_field_name("body") {
-        compute_complexity(body, &[], &mut cx);
-    }
     ctx.result.definitions.push(def);
+    if label == "Enum" {
+        extract_enum_members(ctx, node, &class_qn);
+    }
+    extract_class_methods(ctx, node, &class_qn, spec);
+    extract_class_fields(ctx, node, &class_qn, spec);
 }
 
 /// Full extraction without the Module node (C
@@ -1186,7 +1568,77 @@ def work(items, flag):
         let defs = run(Language::JAVASCRIPT, src, "a.js");
         let c = defs.iter().find(|d| d.name == "UserService").expect("def");
         assert_eq!(c.label, "Class");
-        assert!(c.base_classes.iter().any(|b| b.contains("Base")));
+        assert!(c.base_classes.contains(&"Base".to_string()), "{c:?}");
+        assert!(
+            !c.base_classes.contains(&"extends".to_string()),
+            "keyword filtered"
+        );
+    }
+
+    #[test]
+    fn class_methods_js() {
+        let src = r#"class UserService extends Base {
+  name = "svc";
+  method(a, b) { return a; }
+  arrow = () => 1;
+}"#;
+        let defs = run(Language::JAVASCRIPT, src, "a.js");
+        let c = defs
+            .iter()
+            .find(|d| d.name == "UserService")
+            .expect("class");
+        assert_eq!(c.label, "Class");
+        assert!(c.base_classes.contains(&"Base".to_string()), "{c:?}");
+        assert!(
+            !c.base_classes.contains(&"extends".to_string()),
+            "keyword filtered"
+        );
+        // Methods: `method` (direct kind) + `arrow` (field_definition arrow).
+        assert!(
+            defs.iter().any(|d| d.name == "method"
+                && d.label == "Method"
+                && d.parent_class.as_deref() == Some("proj.a.UserService")),
+            "{defs:?}"
+        );
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "arrow" && d.label == "Method"));
+        // JS field_node_types is empty_types in the C spec table — class
+        // FIELDS extract only for languages with field kinds (Java below).
+        assert!(!defs.iter().any(|d| d.label == "Field"), "{defs:?}");
+    }
+
+    #[test]
+    fn java_class_fields() {
+        let src = r#"class UserService {
+  private String name;
+  public int count;
+}"#;
+        let defs = run(Language::JAVA, src, "UserService.java");
+        assert!(
+            defs.iter().any(|d| d.name == "name"
+                && d.label == "Field"
+                && d.parent_class.as_deref() == Some("proj.UserService")),
+            "{defs:?}"
+        );
+        assert!(defs.iter().any(|d| d.name == "count" && d.label == "Field"));
+    }
+
+    #[test]
+    fn java_enum_members() {
+        let src = r#"
+enum Color { RED, GREEN }
+"#;
+        let defs = run(Language::JAVA, src, "Color.java");
+        let c = defs.iter().find(|d| d.name == "Color").expect("class");
+        assert_eq!(c.label, "Enum");
+        assert!(
+            defs.iter().any(|d| d.name == "RED"
+                && d.label == "Variable"
+                && d.qualified_name == "proj.Color.RED"),
+            "{defs:?}"
+        );
+        assert!(defs.iter().any(|d| d.name == "GREEN"));
     }
 
     #[test]
