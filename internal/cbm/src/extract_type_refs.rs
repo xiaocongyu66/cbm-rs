@@ -9,7 +9,6 @@ use crate::extract_env_accesses::ExtractCtx;
 use crate::lang_specs::LanguageSpec;
 use crate::types::TypeRef;
 use crate::Language;
-use std::collections::HashSet;
 
 /// Builtin types that should not generate USES_TYPE edges
 /// (C is_builtin_type).
@@ -302,12 +301,17 @@ pub fn extract_type_refs(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
 
 /// Dedup helper for tests: unique type names seen.
 #[cfg(test)]
-pub fn unique_type_names(refs: &[TypeRef]) -> HashSet<&str> {
-    refs.iter().map(|r| r.type_name.as_str()).collect()
+mod test_util {
+    use super::TypeRef;
+    use std::collections::HashSet;
+    pub fn unique_type_names(refs: &[TypeRef]) -> HashSet<&str> {
+        refs.iter().map(|r| r.type_name.as_str()).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_util::unique_type_names;
     use super::*;
     use crate::extract_env_accesses::ExtractCtx;
 
