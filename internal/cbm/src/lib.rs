@@ -23,6 +23,7 @@ pub mod lz4_store;
 pub mod macro_table;
 pub mod minhash;
 pub mod page_builder;
+pub mod service_patterns;
 pub mod sqlite_finalize;
 pub mod sqlite_indexes;
 pub mod sqlite_write_db;
