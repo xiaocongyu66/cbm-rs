@@ -21,6 +21,7 @@ lz4_flex = "0.11"
 zstd = "0.13"
 zstd-safe = "7"
 tree-sitter-jinja2 = "0.0.16"
+tree-sitter-yaml = "0.7"
 
 [profile.release]
 opt-level = 3

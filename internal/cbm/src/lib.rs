@@ -10,6 +10,7 @@ pub mod extract_dbt;
 pub mod extract_defs;
 pub mod extract_env_accesses;
 pub mod extract_imports;
+pub mod extract_k8s;
 pub mod extract_semantic;
 pub mod extract_type_assigns;
 pub mod extract_type_refs;

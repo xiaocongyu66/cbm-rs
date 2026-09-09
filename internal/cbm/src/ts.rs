@@ -50,6 +50,7 @@ fn resolve_grammar(crate_name: &str) -> Option<tree_sitter::Language> {
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "jinja2" => Some(tree_sitter_jinja2::LANGUAGE.into()),
+        "yaml" => Some(tree_sitter_yaml::LANGUAGE.into()),
         _ => None,
     }
 }
