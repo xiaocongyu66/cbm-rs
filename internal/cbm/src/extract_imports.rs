@@ -153,31 +153,32 @@ fn emit_py_aliased_import(
 /// import_statement: `import X` / `import X as Y` / `import a.b, c`
 /// (C process_py_import_stmt).
 fn process_py_import_stmt(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
-    let name_node = node.child_by_field_name("name");
-    if name_node.is_none() {
-        for j in 0..node.child_count() {
-            let child = node.child(j).unwrap();
-            match child.kind() {
-                "dotted_name" | "identifier" => {
-                    let m = crate::fqn::node_text(child, ctx.source);
-                    if !m.is_empty() {
-                        push_import(ctx, python_import_root(m), m);
+    match node.child_by_field_name("name") {
+        None => {
+            for j in 0..node.child_count() {
+                let child = node.child(j).unwrap();
+                match child.kind() {
+                    "dotted_name" | "identifier" => {
+                        let m = crate::fqn::node_text(child, ctx.source);
+                        if !m.is_empty() {
+                            push_import(ctx, python_import_root(m), m);
+                        }
                     }
+                    "aliased_import" => emit_py_aliased_import(ctx, child, None),
+                    _ => {}
                 }
-                "aliased_import" => emit_py_aliased_import(ctx, child, None),
-                _ => {}
             }
         }
-    } else {
-        let name_node = name_node.unwrap();
-        if name_node.kind() == "aliased_import" {
-            // `import util as u` — name field points at the aliased_import;
-            // extract its real module name (not "util as u").
-            emit_py_aliased_import(ctx, name_node, None);
-        } else {
-            let m = crate::fqn::node_text(name_node, ctx.source);
-            if !m.is_empty() {
-                push_import(ctx, python_import_root(m), m);
+        Some(name_node) => {
+            if name_node.kind() == "aliased_import" {
+                // `import util as u` — name field points at the
+                // aliased_import; extract its real module name.
+                emit_py_aliased_import(ctx, name_node, None);
+            } else {
+                let m = crate::fqn::node_text(name_node, ctx.source);
+                if !m.is_empty() {
+                    push_import(ctx, python_import_root(m), m);
+                }
             }
         }
     }
@@ -343,9 +344,7 @@ fn process_import_clause(
                 }
             }
             "named_imports" => {
-                if process_named_imports(ctx, sub, path) {
-                    found = true;
-                }
+                found |= process_named_imports(ctx, sub, path);
             }
             _ => {}
         }
@@ -376,9 +375,7 @@ fn process_es_import_statement(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node
                 found = true;
             }
             "import_clause" => {
-                if process_import_clause(ctx, child, path) {
-                    found = true;
-                }
+                found |= process_import_clause(ctx, child, path);
             }
             _ => {}
         }
@@ -457,10 +454,8 @@ fn walk_es_imports(ctx: &mut ExtractCtx<'_>, root: tree_sitter::Node<'_>) {
                     push_import(ctx, path_last(path), path);
                 }
             }
-        } else if kind == "call_expression" {
-            if process_commonjs_require(ctx, node) {
-                push_children = false;
-            }
+        } else if kind == "call_expression" && process_commonjs_require(ctx, node) {
+            push_children = false;
         }
         if push_children {
             for i in (0..node.child_count()).rev() {
