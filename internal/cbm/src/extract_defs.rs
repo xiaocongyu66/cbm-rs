@@ -125,7 +125,10 @@ const TEMPLATE_DEPTH_LIMIT: usize = 4;
 const FUNC_PARENT_CLIMB_LIMIT: usize = 4;
 
 fn is_cpp_template_inner_kind(kind: &str) -> bool {
-    matches!(kind, "function_definition" | "declaration" | "field_declaration")
+    matches!(
+        kind,
+        "function_definition" | "declaration" | "field_declaration"
+    )
 }
 
 /// C++/CUDA: find the inner function/declaration inside
@@ -274,9 +277,7 @@ pub fn resolve_func_name<'t>(
             }
         }
         // Pony: first plain identifier child.
-        if lang == Language::PONY
-            && matches!(kind, "method" | "constructor" | "ffi_method")
-        {
+        if lang == Language::PONY && matches!(kind, "method" | "constructor" | "ffi_method") {
             if let Some(id) = crate::fqn::find_child_by_kind(node, "identifier") {
                 return Some(id);
             }
@@ -513,7 +514,10 @@ fn is_makefile_special_target(name: &str) -> bool {
 }
 
 fn is_cpp_test_macro(name: &str) -> bool {
-    matches!(name, "TEST" | "TEST_F" | "TEST_P" | "TYPED_TEST" | "TEST_SUITE")
+    matches!(
+        name,
+        "TEST" | "TEST_F" | "TEST_P" | "TYPED_TEST" | "TEST_SUITE"
+    )
 }
 
 /// GoogleTest macro name → `Suite.Name` derived from macro args (#1266).
@@ -534,7 +538,12 @@ fn resolve_cpp_test_macro_name<'a>(
     if args.len() < 2 {
         return None;
     }
-    Some(format!("{}.{}", args[0], args[1]).replace(&format!("{name}."), name).trim().to_string())
+    Some(
+        format!("{}.{}", args[0], args[1])
+            .replace(&format!("{name}."), name)
+            .trim()
+            .to_string(),
+    )
 }
 
 /// Free function inside a namespace keeps the namespace QN (C++
@@ -588,17 +597,14 @@ pub fn extract_func_def(
         return;
     }
     // C++/CUDA GoogleTest macros: derive unique per-case names (#1266).
-    if matches!(ctx.language, Language::CPP | Language::CUDA)
-        && is_cpp_test_macro(&name)
-    {
+    if matches!(ctx.language, Language::CPP | Language::CUDA) && is_cpp_test_macro(&name) {
         if let Some(gtest_name) = resolve_cpp_test_macro_name(&name, node, ctx.source) {
             name = gtest_name;
         }
     }
     // Nix interpolated attrpath has no statically knowable name — an absent
     // node is the honest answer.
-    if ctx.language == Language::NIX
-        && crate::fqn::node_text(name_node, ctx.source).contains("${")
+    if ctx.language == Language::NIX && crate::fqn::node_text(name_node, ctx.source).contains("${")
     {
         return;
     }
@@ -655,8 +661,7 @@ pub fn extract_func_def(
             ));
         }
     }
-    def.is_test = helpers::is_test_file(ctx.rel_path, ctx.language)
-        || ctx.result.is_test_file;
+    def.is_test = helpers::is_test_file(ctx.rel_path, ctx.language) || ctx.result.is_test_file;
     def.docstring = extract_docstring(node, ctx.source, ctx.language);
     // Complexity.
     if !spec.branching_node_types.is_empty() {
@@ -744,7 +749,8 @@ fn extract_param_names_types(
             def.param_names.push(n);
         }
         if let Some(t) = child.child_by_field_name("type") {
-            def.param_types.push(crate::fqn::node_text(t, source).to_string());
+            def.param_types
+                .push(crate::fqn::node_text(t, source).to_string());
         }
     }
 }
@@ -934,26 +940,19 @@ pub fn walk_defs(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
         if frame.next_child == 0 {
             let node = frame.node;
             let kind = node.kind();
-            if !spec.function_node_types.is_empty()
-                && spec.function_node_types.contains(&kind)
-            {
+            if !spec.function_node_types.is_empty() && spec.function_node_types.contains(&kind) {
                 extract_func_def(ctx, node, spec);
                 // Most languages stop; JS/TS-family descend for nested named
                 // defs (factory-actions pattern, #341).
                 let descend = matches!(
                     ctx.language,
-                    Language::TYPESCRIPT
-                        | Language::JAVASCRIPT
-                        | Language::TSX
-                        | Language::ARKTS
+                    Language::TYPESCRIPT | Language::JAVASCRIPT | Language::TSX | Language::ARKTS
                 );
                 if !descend {
                     stack.pop();
                     continue;
                 }
-            } else if !spec.class_node_types.is_empty()
-                && spec.class_node_types.contains(&kind)
-            {
+            } else if !spec.class_node_types.is_empty() && spec.class_node_types.contains(&kind) {
                 extract_class_def_shallow(ctx, node, spec);
                 stack.pop();
                 continue;
@@ -990,12 +989,8 @@ fn extract_class_def_shallow(
     if name.is_empty() {
         return;
     }
-    let qn = crate::fqn::fqn_compute_source_lang(
-        ctx.project,
-        ctx.rel_path,
-        Some(&name),
-        ctx.language,
-    );
+    let qn =
+        crate::fqn::fqn_compute_source_lang(ctx.project, ctx.rel_path, Some(&name), ctx.language);
     let mut def = Definition {
         name: name.to_string(),
         qualified_name: qn.clone(),
@@ -1087,7 +1082,16 @@ def work(items, flag):
             }
         };
         let mut cx = Complexity::default();
-        compute_complexity(body, &["if_statement", "elif_clause", "for_statement", "while_statement"], &mut cx);
+        compute_complexity(
+            body,
+            &[
+                "if_statement",
+                "elif_clause",
+                "for_statement",
+                "while_statement",
+            ],
+            &mut cx,
+        );
         assert!(cx.cyclomatic >= 4, "{cx:?}");
         assert!(cx.cognitive > cx.cyclomatic, "nesting penalty — {cx:?}");
         assert!(cx.loop_count >= 2);
@@ -1115,7 +1119,11 @@ def work(items, flag):
         assert!(f.param_names.contains(&"alpha".to_string()));
         assert_eq!(f.return_type.as_deref(), Some("bool"));
         // Python docstring.
-        let with_doc = run(Language::PYTHON, "def g():\n    \"\"\"Does things.\"\"\"\n", "app.py");
+        let with_doc = run(
+            Language::PYTHON,
+            "def g():\n    \"\"\"Does things.\"\"\"\n",
+            "app.py",
+        );
         let g = with_doc.iter().find(|d| d.name == "g").unwrap();
         assert!(g.docstring.as_deref().unwrap_or("").contains("Does things"));
     }
@@ -1131,7 +1139,8 @@ def work(items, flag):
 
     #[test]
     fn go_method_receiver() {
-        let src = "package app\ntype Svc struct{}\nfunc (s *Svc) Start() error {\n\treturn nil\n}\n";
+        let src =
+            "package app\ntype Svc struct{}\nfunc (s *Svc) Start() error {\n\treturn nil\n}\n";
         let defs = run(Language::GO, src, "a.go");
         let m = defs.iter().find(|d| d.name == "Start").expect("def");
         assert_eq!(m.label, "Method");
