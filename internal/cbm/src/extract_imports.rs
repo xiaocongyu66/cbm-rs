@@ -610,12 +610,346 @@ pub fn extract_imports(ctx: &mut ExtractCtx<'_>, ported: fn(Language) -> bool) {
             walk_es_imports(ctx, ctx.root)
         }
         Language::JAVA => parse_java_imports(ctx),
+        Language::KOTLIN => parse_kotlin_imports(ctx),
+        Language::CSHARP => parse_csharp_imports(ctx),
         Language::RUST => parse_rust_imports(ctx),
+        Language::C | Language::CPP | Language::OBJC => parse_c_imports(ctx),
+        Language::PHP => {
+            // PHP `use Foo\Bar;` is a namespace_use_declaration;
+            // require/include are expression_statements. Both handled.
+            parse_php_imports(ctx)
+        }
+        Language::RUBY => parse_ruby_imports(ctx),
+        Language::LUA => parse_lua_imports(ctx),
+        Language::SCALA => parse_generic_imports(ctx, "import_declaration"),
+        Language::ELIXIR => parse_generic_imports(ctx, "call"),
+        Language::BASH => parse_generic_imports(ctx, "command"),
         _ => {}
     }
 }
 
-/// Languages ported so far (part 1).
+// ── Part 2: Kotlin / C# / Ruby / Lua / C-family / PHP / generic ──
+
+/// path/source/module/name field → import (C try_generic_path_fields).
+fn try_generic_path_fields(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) -> bool {
+    for f in ["path", "source", "module", "name"] {
+        if let Some(path_node) = node.child_by_field_name(f) {
+            let path = strip_quotes(crate::fqn::node_text(path_node, ctx.source));
+            if !path.is_empty() {
+                push_import(ctx, path_last(path), path);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Fallback: import path from full node text, stripping the keyword before
+/// the first space, a trailing ';', and surrounding quotes (Pony
+/// `use "util"`, func `#include "utils.fc"`), C generic_import_from_text.
+fn generic_import_from_text(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    let text = crate::fqn::node_text(node, ctx.source);
+    if text.is_empty() {
+        return;
+    }
+    let after_space = match text.find(' ') {
+        Some(i) => &text[i + 1..],
+        None => text,
+    };
+    let after_semi = after_space.strip_suffix(';').unwrap_or(after_space);
+    let cleaned = strip_quotes(after_semi);
+    if !cleaned.is_empty() {
+        push_import(ctx, path_last(cleaned), cleaned);
+    }
+}
+
+/// Kotlin import_header / import_list (C extract_one_import_header +
+/// parse_kotlin_imports): generic path fields, then text fallback.
+fn extract_one_import_header(ctx: &mut ExtractCtx<'_>, header: tree_sitter::Node<'_>) {
+    if !try_generic_path_fields(ctx, header) {
+        generic_import_from_text(ctx, header);
+    }
+}
+
+fn parse_kotlin_imports(ctx: &mut ExtractCtx<'_>) {
+    let root = ctx.root;
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if kind == "import_header" {
+            extract_one_import_header(ctx, node);
+        } else if kind == "import_list" {
+            for j in 0..node.child_count() {
+                let child = node.child(j).unwrap();
+                if child.kind() == "import_header" {
+                    extract_one_import_header(ctx, child);
+                }
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// C# using_directives (C parse_csharp_imports): the right-most
+/// qualified_name/identifier/member_access/name named child is the target
+/// even in alias form `using F = X;`; alias field overrides the local name.
+fn parse_csharp_imports(ctx: &mut ExtractCtx<'_>) {
+    let root = ctx.root;
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        if node.kind() == "using_directive" {
+            let mut path_node: tree_sitter::Node<'_> = node;
+            let mut found = false;
+            for i in (0..node.named_child_count()).rev() {
+                let c = node.named_child(i).unwrap();
+                if matches!(
+                    c.kind(),
+                    "qualified_name" | "identifier" | "member_access_expression" | "name"
+                ) {
+                    path_node = c;
+                    found = true;
+                    break;
+                }
+            }
+            let path = if found {
+                crate::fqn::node_text(path_node, ctx.source)
+            } else {
+                ""
+            };
+            if path.is_empty() {
+                // Fallback handles `using static X;`.
+                if !try_generic_path_fields(ctx, node) {
+                    generic_import_from_text(ctx, node);
+                }
+            } else {
+                let local = match node.child_by_field_name("alias") {
+                    Some(a) => crate::fqn::node_text(a, ctx.source),
+                    None => path_last(path),
+                };
+                push_import(ctx, local, path);
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// Ruby require/require_relative method name (C ruby_require_method).
+fn ruby_require_method<'t>(node: tree_sitter::Node<'t>, source: &'t str) -> Option<&'t str> {
+    let method = node.child_by_field_name("method").or_else(|| {
+        if node.child_count() > 0 {
+            node.child(0)
+        } else {
+            None
+        }
+    })?;
+    let name = crate::fqn::node_text(method, source);
+    if name == "require" || name == "require_relative" {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Ruby require string argument (C extract_ruby_require_arg).
+fn extract_ruby_require_arg<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    let args = node.child_by_field_name("arguments").or_else(|| {
+        if node.child_count() > 1 {
+            node.child(1)
+        } else {
+            None
+        }
+    })?;
+    for j in 0..args.child_count() {
+        let c = args.child(j)?;
+        if matches!(c.kind(), "string" | "string_literal") {
+            return Some(strip_quotes(crate::fqn::node_text(c, source)).to_string());
+        }
+    }
+    Some(strip_quotes(crate::fqn::node_text(args, source)).to_string())
+}
+
+/// Ruby walk (C parse_ruby_imports): call/command_call nodes whose method
+/// is require/require_relative.
+fn parse_ruby_imports(ctx: &mut ExtractCtx<'_>) {
+    let root = ctx.root;
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if (kind == "call" || kind == "command_call")
+            && ruby_require_method(node, ctx.source).is_some()
+        {
+            if let Some(arg_text) = extract_ruby_require_arg(node, ctx.source) {
+                if !arg_text.is_empty() {
+                    push_import(ctx, path_last(&arg_text), &arg_text);
+                }
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// Lua require (C parse_lua_imports): text-scan for require("...") inside
+/// assignment/variable_declaration nodes.
+fn parse_lua_imports(ctx: &mut ExtractCtx<'_>) {
+    let root = ctx.root;
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        let text = crate::fqn::node_text(node, ctx.source);
+        if let Some(req_pos) = text.find("require") {
+            let req = &text[req_pos..];
+            let open = req
+                .find('(')
+                .or_else(|| req.find('"'))
+                .or_else(|| req.find('\''));
+            if let Some(open) = open {
+                let after = &req[open..];
+                let q1 = after.find('"');
+                let q2 = after.find('\'');
+                let (q, qch) = match (q1, q2) {
+                    (Some(a), Some(b)) => {
+                        if a < b {
+                            (a, '"')
+                        } else {
+                            (b, '\'')
+                        }
+                    }
+                    (Some(a), None) => (a, '"'),
+                    (None, Some(b)) => (b, '\''),
+                    _ => {
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let inner = &after[q + 1..];
+                if let Some(close) = inner.find(qch) {
+                    let raw = format!("{qch}{}{qch}", &inner[..close]);
+                    let path = strip_quotes(&raw).to_string();
+                    if !path.is_empty() {
+                        let p = path.clone();
+                        push_import(ctx, path_last(&p), &p);
+                    }
+                }
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// C-family includes (C parse_c_imports): #include / #import lines.
+fn parse_c_imports(ctx: &mut ExtractCtx<'_>) {
+    let root = ctx.root;
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if kind == "preproc_include" || kind == "preproc_def" {
+            if let Some(p) = node.child_by_field_name("path") {
+                let path = strip_quotes(crate::fqn::node_text(p, ctx.source));
+                if !path.is_empty() {
+                    push_import(ctx, path_last(path), path);
+                }
+            } else {
+                generic_import_from_text(ctx, node);
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// PHP: namespace_use_declaration use clauses + require/include expression
+/// statements (C parse_php_imports).
+fn parse_php_imports(ctx: &mut ExtractCtx<'_>) {
+    let root = ctx.root;
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        if kind == "namespace_use_declaration" {
+            for j in 0..node.named_child_count() {
+                let child = node.named_child(j).unwrap();
+                // use Foo\Bar; or use Foo\Bar as B;
+                let text = crate::fqn::node_text(child, ctx.source);
+                let path = text.split(" as ").next().unwrap_or(text).trim();
+                if !path.is_empty() {
+                    push_import(ctx, path_last(path), path);
+                }
+            }
+        } else if matches!(
+            kind,
+            "expression_statement" | "include_expression" | "require_expression"
+        ) && text_has_require_include(node, ctx.source)
+        {
+            generic_import_from_text(ctx, node);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn text_has_require_include(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let text = crate::fqn::node_text(node, source);
+    text.starts_with("require ")
+        || text.starts_with("include ")
+        || text.starts_with("require ")
+        || text.contains("require")
+        || text.contains("include")
+}
+
+/// Generic import parser (C parse_generic_imports): top-level nodes of
+/// `node_type`, generic fields then text fallback.
+fn parse_generic_imports(ctx: &mut ExtractCtx<'_>, node_type: &str) {
+    let root = ctx.root;
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        if node.kind() == node_type && !try_generic_path_fields(ctx, node) {
+            generic_import_from_text(ctx, node);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// Languages ported in parts 1+2.
 pub fn ported_languages(lang: Language) -> bool {
     matches!(
         lang,
@@ -627,6 +961,14 @@ pub fn ported_languages(lang: Language) -> bool {
             | Language::ARKTS
             | Language::JAVA
             | Language::RUST
+            | Language::KOTLIN
+            | Language::CSHARP
+            | Language::RUBY
+            | Language::LUA
+            | Language::C
+            | Language::CPP
+            | Language::OBJC
+            | Language::PHP
     )
 }
 
