@@ -18,6 +18,7 @@ pub mod extract_unified;
 pub mod extract_usages;
 pub mod fqn;
 pub mod helpers;
+pub mod iris_export_xml;
 pub mod lang_specs;
 pub mod lz4_store;
 pub mod macro_table;
