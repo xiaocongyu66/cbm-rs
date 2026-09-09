@@ -5,6 +5,7 @@
 
 pub mod ast_profile;
 pub mod extract_env_accesses;
+pub mod extract_imports;
 pub mod extract_semantic;
 pub mod extract_type_assigns;
 pub mod extract_type_refs;

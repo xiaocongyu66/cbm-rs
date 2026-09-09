@@ -46,6 +46,9 @@ fn resolve_grammar(crate_name: &str) -> Option<tree_sitter::Language> {
     match crate_name {
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
+        "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        "java" => Some(tree_sitter_java::LANGUAGE.into()),
+        "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         _ => None,
     }
 }
