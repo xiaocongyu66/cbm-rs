@@ -4,6 +4,7 @@
 //! crates; ts_runtime becomes the tree-sitter Rust runtime.
 
 pub mod ast_profile;
+pub mod extract_calls;
 pub mod extract_env_accesses;
 pub mod extract_imports;
 pub mod extract_semantic;
