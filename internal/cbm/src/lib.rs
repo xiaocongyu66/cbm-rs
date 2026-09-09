@@ -5,6 +5,7 @@
 
 pub mod ast_profile;
 pub mod extract_calls;
+pub mod extract_defs;
 pub mod extract_env_accesses;
 pub mod extract_imports;
 pub mod extract_semantic;
