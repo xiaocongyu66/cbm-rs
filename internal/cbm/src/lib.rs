@@ -9,6 +9,7 @@ pub mod extract_imports;
 pub mod extract_semantic;
 pub mod extract_type_assigns;
 pub mod extract_type_refs;
+pub mod extract_usages;
 pub mod fqn;
 pub mod helpers;
 pub mod lang_specs;
