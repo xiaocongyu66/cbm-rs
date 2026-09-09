@@ -11,7 +11,6 @@ use crate::helpers;
 use crate::lang_specs::LanguageSpec;
 use crate::types::{ReadWrite, Throw};
 use crate::Language;
-use std::collections::HashSet;
 
 const MAX_EXCEPTION_NAME_LEN: usize = 100;
 
@@ -22,14 +21,12 @@ fn is_throw_node(node: tree_sitter::Node<'_>, spec: &LanguageSpec) -> bool {
     if spec.throw_node_types.contains(&node.kind()) {
         return true;
     }
-    if spec.language == Language::KOTLIN && node.kind() == "jump_expression" {
-        if node.child_count() > 0 {
-            if let Some(c) = node.child(0) {
-                if c.kind() == "throw" {
-                    return true;
-                }
-            }
-        }
+    if spec.language == Language::KOTLIN
+        && node.kind() == "jump_expression"
+        && node.child_count() > 0
+        && node.child(0).map(|c| c.kind() == "throw").unwrap_or(false)
+    {
+        return true;
     }
     false
 }
@@ -313,12 +310,6 @@ fn walk_readwrites(ctx: &mut ExtractCtx<'_>, root: tree_sitter::Node<'_>, spec: 
 pub fn extract_semantic(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
     walk_throws(ctx, ctx.root, spec);
     walk_readwrites(ctx, ctx.root, spec);
-}
-
-/// Unique exception names (test helper).
-#[cfg(test)]
-pub(crate) fn unique_exceptions(throws: &[Throw]) -> HashSet<&str> {
-    throws.iter().map(|t| t.exception_name.as_str()).collect()
 }
 
 #[cfg(test)]
