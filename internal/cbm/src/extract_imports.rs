@@ -6,6 +6,7 @@
 //! the C's per-language fan-out shape).
 
 use crate::extract_env_accesses::ExtractCtx;
+use crate::lang_specs::LanguageSpec;
 use crate::types::Import;
 use crate::Language;
 
@@ -603,6 +604,7 @@ pub fn extract_imports(ctx: &mut ExtractCtx<'_>, ported: fn(Language) -> bool) {
     if !ported(ctx.language) {
         return;
     }
+
     match ctx.language {
         Language::GO => parse_go_imports(ctx),
         Language::PYTHON => parse_python_imports(ctx),
@@ -624,7 +626,20 @@ pub fn extract_imports(ctx: &mut ExtractCtx<'_>, ported: fn(Language) -> bool) {
         Language::SCALA => parse_generic_imports(ctx, "import_declaration"),
         Language::ELIXIR => parse_generic_imports(ctx, "call"),
         Language::BASH => parse_generic_imports(ctx, "command"),
-        _ => {}
+        Language::ERLANG => parse_generic_imports(ctx, "module_attribute"),
+        Language::OCAML => parse_generic_imports(ctx, "open_module"),
+        Language::PERL => parse_generic_imports(ctx, "use_statement"),
+        Language::GROOVY => parse_generic_imports(ctx, "groovy_import"),
+        Language::SWIFT => parse_generic_imports(ctx, "import_declaration"),
+        Language::LEAN => parse_generic_imports(ctx, "import"),
+        Language::FORM => parse_generic_imports(ctx, "include_directive"),
+        Language::MAGMA => parse_generic_imports(ctx, "load_statement"),
+        // Everything else: spec-driven generic extraction (equivalent power
+        // to the C's per-language parsers, which end in the same helpers).
+        _ => {
+            let spec = crate::lang_specs::lang_spec(ctx.language);
+            parse_spec_imports(ctx, spec);
+        }
     }
 }
 
@@ -949,8 +964,33 @@ fn parse_generic_imports(ctx: &mut ExtractCtx<'_>, node_type: &str) {
     }
 }
 
-/// Languages ported in parts 1+2.
-pub fn ported_languages(lang: Language) -> bool {
+/// Spec-driven imports (C parse_spec_imports): top-level nodes matching
+/// the language's import_node_types, generic fields then text fallback.
+/// This is the fallback for languages without a dedicated parser — and it
+/// carries the same extraction power, since both end in the same two
+/// generic helpers.
+fn parse_spec_imports(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
+    if spec.import_node_types.is_empty() {
+        return;
+    }
+    let mut cursor = ctx.root.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let node = cursor.node();
+        if spec.import_node_types.contains(&node.kind()) && !try_generic_path_fields(ctx, node) {
+            generic_import_from_text(ctx, node);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// Languages whose dedicated parser is ported (parts 1-2); everything else
+/// in `ALL` falls through to parse_spec_imports.
+fn has_dedicated_parser(lang: Language) -> bool {
     matches!(
         lang,
         Language::GO
@@ -960,16 +1000,26 @@ pub fn ported_languages(lang: Language) -> bool {
             | Language::TSX
             | Language::ARKTS
             | Language::JAVA
-            | Language::RUST
             | Language::KOTLIN
             | Language::CSHARP
-            | Language::RUBY
-            | Language::LUA
+            | Language::RUST
             | Language::C
             | Language::CPP
             | Language::OBJC
             | Language::PHP
+            | Language::RUBY
+            | Language::LUA
     )
+}
+
+/// Languages with extraction coverage (parts 1-3): dedicated parsers plus
+/// the spec-driven fallback that covers every language with
+/// import_node_types.
+pub fn ported_languages(lang: Language) -> bool {
+    has_dedicated_parser(lang)
+        || !crate::lang_specs::lang_spec(lang)
+            .import_node_types
+            .is_empty()
 }
 
 #[cfg(test)]
