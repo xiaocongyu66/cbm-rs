@@ -19,6 +19,7 @@ pub mod lang_specs;
 pub mod minhash;
 pub mod page_builder;
 pub mod sqlite_finalize;
+pub mod sqlite_indexes;
 pub mod sqlite_writer;
 pub mod ts;
 pub mod types;

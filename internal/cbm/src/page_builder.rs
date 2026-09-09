@@ -15,7 +15,6 @@
 //!                       {left_child(4), varint(max_rowid)}
 //!   overflow pages    = 4-byte next-page pointer + up to PAGE_SIZE-4 data
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 
@@ -27,6 +26,7 @@ use crate::sqlite_writer::{
 
 const INTERIOR_TABLE_FLAG: u8 = 0x05;
 const LEAF_TABLE_FLAG: u8 = 0x0D;
+const LEAF_INDEX_FLAG: u8 = 0x0A;
 const HDR_FREEBLOCK_OFF: usize = 1;
 const HDR_CELLCOUNT_OFF: usize = 3;
 const HDR_CONTENT_OFF: usize = 5;
@@ -48,9 +48,11 @@ struct PageRef {
     sep_cell: Option<Vec<u8>>,
 }
 
-/// Streaming table-B-tree page builder (C PageBuilder): owns the output
-/// file handle, builds leaf pages as cells arrive, tracks leaf refs for
-/// interior assembly at finalize.
+/// Streaming table/index B-tree page builder (C PageBuilder): owns the
+/// output file handle, builds leaf pages as cells arrive, tracks leaf refs
+/// for interior assembly at finalize. Table mode (is_index=false) emits
+/// 0x0D leaves with rowid keys; index mode emits 0x0A leaves with
+/// separator cells promoted to the interior pages.
 pub struct PageBuilder {
     file: File,
     next_page: u32,
@@ -59,6 +61,10 @@ pub struct PageBuilder {
     cell_count: i32,
     content_offset: usize,
     ptr_offset: usize,
+    is_index: bool,
+    /// Separator queued for the leaf flushed next (index mode: the cell
+    /// promoted by promote_and_flush / the trailing cell at finalize).
+    pending_sep: Option<Vec<u8>>,
     leaves: Vec<PageRef>,
 }
 
@@ -79,8 +85,18 @@ impl PageBuilder {
             cell_count: 0,
             content_offset: CBM_PAGE_SIZE as usize,
             ptr_offset: page1_offset + BTREE_HEADER_SIZE,
+            is_index: false,
+            pending_sep: None,
             leaves: Vec::new(),
         })
+    }
+
+    /// Index B-tree mode (C pb_init with is_index=true): 0x0A leaf pages,
+    /// separator-cell interior keys.
+    pub fn open_index(file: &mut File, start_page: u32) -> std::io::Result<Self> {
+        let mut pb = Self::open(file, start_page)?;
+        pb.is_index = true;
+        Ok(pb)
     }
 
     /// Flush the current leaf page to disk and record it
@@ -90,7 +106,11 @@ impl PageBuilder {
             return Ok(());
         }
         let hdr = self.page1_offset;
-        self.page[hdr] = LEAF_TABLE_FLAG;
+        self.page[hdr] = if self.is_index {
+            LEAF_INDEX_FLAG
+        } else {
+            LEAF_TABLE_FLAG
+        };
         put_u16(&mut self.page[hdr + HDR_FREEBLOCK_OFF..], 0);
         put_u16(
             &mut self.page[hdr + HDR_CELLCOUNT_OFF..],
@@ -111,7 +131,7 @@ impl PageBuilder {
         self.leaves.push(PageRef {
             page_num,
             max_key,
-            sep_cell: None,
+            sep_cell: self.pending_sep.take(),
         });
 
         // Reset for the next page.
@@ -124,13 +144,13 @@ impl PageBuilder {
         Ok(())
     }
 
-    fn cell_fits(&self, cell_len: usize) -> bool {
+    pub(crate) fn cell_fits(&self, cell_len: usize) -> bool {
         // Cell pointer (2 bytes) + cell content.
         let available = self.content_offset - self.ptr_offset - CELL_PTR_SIZE;
         cell_len <= available
     }
 
-    fn add_cell(&mut self, cell: &[u8]) {
+    pub(crate) fn add_cell(&mut self, cell: &[u8]) {
         // Content grows down, pointer grows up.
         self.content_offset -= cell.len();
         self.page[self.content_offset..self.content_offset + cell.len()].copy_from_slice(cell);
@@ -178,38 +198,72 @@ impl PageBuilder {
     /// 4-byte next-page pointer + up to PAGE_SIZE-4 data bytes; the final
     /// page's pointer is 0. Returns the first overflow page number.
     fn write_overflow_pages(&mut self, data: &[u8]) -> std::io::Result<u32> {
-        let per_page = CBM_PAGE_SIZE as usize - BTREE_PTR_SIZE;
-        let mut first_page = 0u32;
-        let mut prev_next_ptr_offset: i64 = -1;
+        write_overflow_chain(&mut self.file, &mut self.next_page, data)
+    }
 
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let pnum = self.next_page;
-            self.next_page += 1;
-            if first_page == 0 {
-                first_page = pnum;
-            }
-            // Backpatch the previous overflow page's next-page pointer.
-            if prev_next_ptr_offset >= 0 {
-                let mut ptr = [0u8; BTREE_PTR_SIZE];
-                put_u32(&mut ptr, pnum);
-                self.file
-                    .seek(SeekFrom::Start(prev_next_ptr_offset as u64))?;
-                self.file.write_all(&ptr)?;
-            }
+    /// Allocate the next page number, skipping the pending-byte page.
+    pub(crate) fn alloc_page(&mut self) -> u32 {
+        self.next_page = skip_pending_byte(self.next_page);
+        let p = self.next_page;
+        self.next_page += 1;
+        p
+    }
 
-            let chunk = (data.len() - offset).min(per_page);
-            let mut page = vec![0u8; CBM_PAGE_SIZE as usize];
-            put_u32(&mut page, 0); // next-page pointer, backpatched next loop
-            page[BTREE_PTR_SIZE..BTREE_PTR_SIZE + chunk]
-                .copy_from_slice(&data[offset..offset + chunk]);
-            let po = (pnum - 1) as u64 * CBM_PAGE_SIZE as u64;
-            self.file.seek(SeekFrom::Start(po))?;
-            self.file.write_all(&page)?;
-            prev_next_ptr_offset = po as i64;
-            offset += chunk;
-        }
-        Ok(first_page)
+    /// Current next-page cursor (callers that pre-allocate their own pages,
+    /// e.g. the empty-table leaf writer).
+    pub(crate) fn next_page_cursor(&self) -> u32 {
+        self.next_page
+    }
+
+    /// Add an index cell to the current leaf page (C pb_add_cell inside
+    /// the write_index_btree loop); the caller drives page-full promotion.
+    pub(crate) fn add_index_cell(&mut self, cell: &[u8]) {
+        self.add_cell(cell);
+    }
+
+    /// Number of cells on the current (unflushed) leaf page.
+    pub(crate) fn cell_count(&self) -> i32 {
+        self.cell_count
+    }
+
+    /// Remove the last-added cell from the page (C's cell_count-- /
+    /// content_offset += / ptr_offset -= in pb_promote_and_flush).
+    pub(crate) fn unadd_cell(&mut self, cell: &[u8]) {
+        self.cell_count -= 1;
+        self.content_offset += cell.len();
+        self.ptr_offset -= CELL_PTR_SIZE;
+    }
+
+    /// Page-full path (C pb_promote_and_flush): the promoted cell is
+    /// REMOVED from the leaf (SQLite index B-trees count interior keys in
+    /// integrity_check, so the separator must not also live in the leaf)
+    /// and flushes the page with that cell as the interior separator.
+    pub(crate) fn promote_and_flush(&mut self, sep_cell: &[u8]) -> std::io::Result<()> {
+        self.unadd_cell(sep_cell);
+        self.pending_sep = Some(sep_cell.to_vec());
+        self.flush_leaf(0)
+    }
+
+    /// Trailing-leaf path (C write_index_btree post-loop): the last cell
+    /// STAYS in the leaf; only the interior separator reference is set
+    /// (the last leaf is always the rightmost child, so its separator is
+    /// never used as an interior key).
+    pub(crate) fn flush_leaf_with_sep(&mut self, sep_cell: &[u8]) -> std::io::Result<()> {
+        self.pending_sep = Some(sep_cell.to_vec());
+        self.flush_leaf(0)
+    }
+
+    /// Finalize an index B-tree: assemble interior pages over the flushed
+    /// leaves, return (root_page, next_free_page) (C pb_build_interior,
+    /// index mode). Caller must have flushed all cells.
+    pub(crate) fn finalize_index(mut self) -> std::io::Result<(u32, u32)> {
+        let next_page = self.next_page;
+        let root = match self.leaves.len() {
+            0 => 0,
+            1 => self.leaves[0].page_num,
+            _ => build_interior(&mut self.file, &mut self.next_page, &self.leaves, true)?,
+        };
+        Ok((root, next_page))
     }
 
     /// Finalize: flush the trailing leaf, assemble interior pages, return
@@ -335,42 +389,49 @@ fn build_interior(
     Ok(children[0].page_num)
 }
 
-/// Schema text registry: table/index CREATE statements exactly as the C
-/// writes them into sqlite_master (ordering table → autoindex → indexes is
-/// enforced at finalize).
-pub const SCHEMA_SQL_PROJECTS: &str = "CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT NULL,\n\t\troot_path TEXT NOT NULL\n\t)";
-pub const SCHEMA_SQL_FILE_HASHES: &str = "CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\trel_path TEXT NOT NULL,\n\t\tsha256 TEXT NOT NULL,\n\t\tmtime_ns INTEGER NOT NULL DEFAULT 0,\n\t\tsize INTEGER NOT NULL DEFAULT 0,\n\t\tPRIMARY KEY (project, rel_path)\n\t)";
-pub const SCHEMA_SQL_NODES: &str = "CREATE TABLE nodes (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT '',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties TEXT DEFAULT '{}',\n\t\tUNIQUE(project, qualified_name)\n\t)";
-pub const SCHEMA_SQL_IDX_NODES_LABEL: &str =
-    "CREATE INDEX idx_nodes_label ON nodes(project, label)";
-pub const SCHEMA_SQL_IDX_NODES_NAME: &str = "CREATE INDEX idx_nodes_name ON nodes(project, name)";
-pub const SCHEMA_SQL_IDX_NODES_FILE: &str =
-    "CREATE INDEX idx_nodes_file ON nodes(project, file_path)";
-pub const SCHEMA_SQL_EDGES: &str = "CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT '{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS (CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') ELSE '' END),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen)\n\t)";
-pub const SCHEMA_SQL_IDX_EDGES_SOURCE: &str =
-    "CREATE INDEX idx_edges_source ON edges(source_id, type)";
-pub const SCHEMA_SQL_IDX_EDGES_TARGET: &str =
-    "CREATE INDEX idx_edges_target ON edges(target_id, type)";
-pub const SCHEMA_SQL_IDX_EDGES_TYPE: &str = "CREATE INDEX idx_edges_type ON edges(project, type)";
-pub const SCHEMA_SQL_IDX_EDGES_TARGET_TYPE: &str =
-    "CREATE INDEX idx_edges_target_type ON edges(project, target_id, type)";
-pub const SCHEMA_SQL_IDX_EDGES_SOURCE_TYPE: &str =
-    "CREATE INDEX idx_edges_source_type ON edges(project, source_id, type)";
-pub const SCHEMA_SQL_IDX_EDGES_URL_PATH: &str =
-    "CREATE INDEX idx_edges_url_path ON edges(project, url_path_gen)";
+/// Overflow page chain writer (C write_overflow_pages, free-function form):
+/// used both by the table PageBuilder and by index overflow spilling, which
+/// runs BEFORE page building and therefore cannot hold a PageBuilder.
+pub fn write_overflow_chain(
+    file: &mut File,
+    next_page: &mut u32,
+    data: &[u8],
+) -> std::io::Result<u32> {
+    let per_page = CBM_PAGE_SIZE as usize - BTREE_PTR_SIZE;
+    let mut first_page = 0u32;
+    let mut prev_next_ptr_offset: i64 = -1;
 
-/// sqlite_master entry (C MasterEntry).
-#[derive(Debug, Clone)]
-pub struct MasterEntry {
-    pub typ: &'static str, // "table" | "index"
-    pub name: &'static str,
-    pub tbl_name: &'static str,
-    pub root_page: u32,
-    pub sql: Option<&'static str>,
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let pnum = *next_page;
+        *next_page += 1;
+        if first_page == 0 {
+            first_page = pnum;
+        }
+        // Backpatch the previous overflow page's next-page pointer.
+        if prev_next_ptr_offset >= 0 {
+            let mut ptr = [0u8; BTREE_PTR_SIZE];
+            put_u32(&mut ptr, pnum);
+            file.seek(SeekFrom::Start(prev_next_ptr_offset as u64))?;
+            file.write_all(&ptr)?;
+        }
+
+        let chunk = (data.len() - offset).min(per_page);
+        let mut page = vec![0u8; CBM_PAGE_SIZE as usize];
+        put_u32(&mut page, 0); // next-page pointer, backpatched next loop
+        page[BTREE_PTR_SIZE..BTREE_PTR_SIZE + chunk].copy_from_slice(&data[offset..offset + chunk]);
+        let po = (pnum - 1) as u64 * CBM_PAGE_SIZE as u64;
+        file.seek(SeekFrom::Start(po))?;
+        file.write_all(&page)?;
+        prev_next_ptr_offset = po as i64;
+        offset += chunk;
+    }
+    Ok(first_page)
 }
 
 /// One-shot write of a complete table B-tree from prepared records
-/// (C write_table_btree). Returns (root_page, next_page).
+/// (C write_table_btree). Empty input writes a single empty leaf page and
+/// returns its page number (the C allocates a page, NOT root 0).
 pub fn write_table_btree(
     file: &mut File,
     next_page: &mut u32,
@@ -378,7 +439,12 @@ pub fn write_table_btree(
     records: &[Vec<u8>],
 ) -> std::io::Result<(u32, u32)> {
     if records.is_empty() {
-        return Ok((0, *next_page));
+        let mut pb = PageBuilder::open(file, *next_page)?;
+        let pnum = pb.alloc_page();
+        let np = pb.next_page_cursor();
+        write_empty_leaf_page(file, pnum, false)?;
+        *next_page = np;
+        return Ok((pnum, np));
     }
     let mut pb = PageBuilder::open(file, *next_page)?;
     for (i, rec) in records.iter().enumerate() {
@@ -391,6 +457,30 @@ pub fn write_table_btree(
     let (root, np) = pb.finalize_table(rowids[rowids.len() - 1])?;
     *next_page = np;
     Ok((root, np))
+}
+
+/// Write an empty B-tree leaf page (C write_table_btree count==0 branch /
+/// write_empty_index_leaf): flag + zeroed header fields, content offset at
+/// page end. `is_index` selects 0x0A (the C's empty index leaf writes
+/// NEWLINE_BYTE 0x0A at page start; 0x0A == empty index leaf flag).
+pub(crate) fn write_empty_leaf_page(
+    file: &mut File,
+    page_num: u32,
+    is_index: bool,
+) -> std::io::Result<()> {
+    let mut page = vec![0u8; CBM_PAGE_SIZE as usize];
+    page[0] = if is_index {
+        LEAF_INDEX_FLAG
+    } else {
+        LEAF_TABLE_FLAG
+    };
+    put_u16(&mut page[HDR_FREEBLOCK_OFF..], 0);
+    put_u16(&mut page[HDR_CELLCOUNT_OFF..], 0);
+    put_u16(&mut page[HDR_CONTENT_OFF..], CBM_PAGE_SIZE as u16);
+    page[HDR_FRAGBYTES_OFF] = 0;
+    let offset = (page_num - 1) as u64 * CBM_PAGE_SIZE as u64;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(&page)
 }
 
 /// Overflow-page count for a payload (helper for tests/finalize sizing).
@@ -436,9 +526,6 @@ fn build_table_cell_overflow(
     cell.extend_from_slice(&ptr);
     cell
 }
-
-/// Page-number allocation map for tests and finalize ordering.
-pub type PageAlloc = HashMap<u32, ()>;
 
 #[cfg(test)]
 mod tests {
@@ -577,10 +664,68 @@ mod tests {
     }
 
     #[test]
-    fn schema_sql_matches_c_strings() {
-        // A few load-bearing fragments must match byte-for-byte.
-        assert!(SCHEMA_SQL_NODES.contains("UNIQUE(project, qualified_name)"));
-        assert!(SCHEMA_SQL_EDGES.contains("local_name_gen TEXT GENERATED ALWAYS AS"));
-        assert!(SCHEMA_SQL_PROJECTS.contains("root_path TEXT NOT NULL"));
+    fn empty_table_allocates_one_leaf_page() {
+        let (mut f, path) = temp_file();
+        let mut next = FIRST_DATA_PAGE;
+        let (root, next2) = write_table_btree(&mut f, &mut next, &[], &[]).unwrap();
+        // The C writes a single empty leaf page for count==0, NOT root 0.
+        assert_eq!(root, FIRST_DATA_PAGE);
+        assert_eq!(next2, FIRST_DATA_PAGE + 1);
+        let bytes = std::fs::read(&path).unwrap();
+        let off = (root - 1) as usize * CBM_PAGE_SIZE as usize;
+        assert_eq!(bytes[off], LEAF_TABLE_FLAG);
+        // 0 cells, content offset at page end (65536 truncated to u16 = 0,
+        // SQLite stores the 64K content start as zero per spec).
+        assert_eq!(bytes[off + HDR_CELLCOUNT_OFF], 0);
+        let content = u16::from_be_bytes([bytes[off + HDR_CONTENT_OFF], bytes[off + 6]]);
+        assert_eq!(content, 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn index_btree_builds_and_promotes_separators() {
+        let (mut f, path) = temp_file();
+        let mut next = FIRST_DATA_PAGE;
+        // Payloads just under the index spill threshold (16422): no overflow
+        // pages, but only 3-4 cells fit per 64K leaf → several leaves →
+        // interior root with promoted separator cells.
+        let mid = "k".repeat(12_000);
+        let cells: Vec<Vec<u8>> = (0..8u32)
+            .map(|i| {
+                let payload = format!("{mid}{:04}", i);
+                let mut cell = Vec::new();
+                let mut tmp = [0u8; 10];
+                let n = put_varint(&mut tmp, payload.len() as i64);
+                cell.extend_from_slice(&tmp[..n]);
+                cell.extend_from_slice(payload.as_bytes());
+                cell
+            })
+            .collect();
+        let root = crate::sqlite_indexes::write_index_btree(&mut f, &mut next, &cells).unwrap();
+        // 8 × ~12KB cells → 2 leaves + 1 interior root = page 4.
+        assert!(root >= 4, "root={root}");
+        let bytes = std::fs::read(&path).unwrap();
+        // Root is an index interior page (0x02); first leaf is 0x0A.
+        let off = (root - 1) as usize * CBM_PAGE_SIZE as usize;
+        assert_eq!(bytes[off], 0x02);
+        let off2 = (FIRST_DATA_PAGE - 1) as usize * CBM_PAGE_SIZE as usize;
+        assert_eq!(bytes[off2], 0x0A);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn empty_index_allocates_one_leaf_page() {
+        let (mut f, path) = temp_file();
+        let mut pb = PageBuilder::open_index(&mut f, FIRST_DATA_PAGE).unwrap();
+        let pnum = pb.alloc_page();
+        let next = pb.next_page_cursor();
+        write_empty_leaf_page(&mut f, pnum, true).unwrap();
+        assert_eq!(pnum, FIRST_DATA_PAGE);
+        assert_eq!(next, FIRST_DATA_PAGE + 1);
+        let bytes = std::fs::read(&path).unwrap();
+        let off = (pnum - 1) as usize * CBM_PAGE_SIZE as usize;
+        // C write_empty_index_leaf writes NEWLINE_BYTE (0x0A == leaf index).
+        assert_eq!(bytes[off], 0x0A);
+        std::fs::remove_file(&path).ok();
     }
 }
