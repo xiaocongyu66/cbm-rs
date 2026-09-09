@@ -16,6 +16,7 @@ pub mod extract_usages;
 pub mod fqn;
 pub mod helpers;
 pub mod lang_specs;
+pub mod lz4_store;
 pub mod minhash;
 pub mod page_builder;
 pub mod sqlite_finalize;
@@ -24,6 +25,7 @@ pub mod sqlite_write_db;
 pub mod sqlite_writer;
 pub mod ts;
 pub mod types;
+pub mod zstd_store;
 
 /// Language enum — 1:1 with C `CBMLanguage` (same order,
 /// `#[repr(u16)]` so the discriminant matches the C indices stored in

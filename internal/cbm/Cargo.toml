@@ -14,3 +14,6 @@ tree-sitter-javascript = { workspace = true }
 tree-sitter-java = { workspace = true }
 tree-sitter-rust = { workspace = true }
 xxhash-rust = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+zstd-safe = { workspace = true }
