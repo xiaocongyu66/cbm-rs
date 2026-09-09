@@ -277,6 +277,21 @@ fn process_func_type_refs(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>)
     }
 }
 
+/// Unified-walk single-node handler (C handle_type_refs): signature refs
+/// on function nodes, body refs keyed by language kind.
+pub fn extract_type_refs_at(
+    ctx: &mut ExtractCtx<'_>,
+    node: tree_sitter::Node<'_>,
+    spec: &LanguageSpec,
+    func_qn: &str,
+) {
+    if !spec.function_node_types.is_empty() && spec.function_node_types.contains(&node.kind()) {
+        process_func_type_refs(ctx, node);
+        return;
+    }
+    process_body_type_ref(ctx, node, func_qn);
+}
+
 /// Walk the AST for function nodes (C walk_type_refs).
 pub fn extract_type_refs(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
     if spec.function_node_types.is_empty() {

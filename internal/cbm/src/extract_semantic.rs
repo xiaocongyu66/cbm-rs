@@ -312,6 +312,44 @@ pub fn extract_semantic(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
     walk_readwrites(ctx, ctx.root, spec);
 }
 
+/// Unified-walk single-node handler (C handle_throws + handle_readwrites):
+/// process one node at the walk's QN. Siblings/children come from the
+/// unified walk itself.
+pub fn extract_semantic_at(
+    ctx: &mut ExtractCtx<'_>,
+    node: tree_sitter::Node<'_>,
+    spec: &LanguageSpec,
+    func_qn: &str,
+) {
+    if is_throw_node(node, spec) {
+        if let Some(mut exc_name) = resolve_exception_name(node, ctx.source) {
+            exc_name.truncate(MAX_EXCEPTION_NAME_LEN);
+            ctx.result.throws.push(Throw {
+                exception_name: exc_name,
+                enclosing_func_qn: func_qn.to_string(),
+            });
+        }
+    }
+    extract_throws_clause(ctx, node, spec, func_qn);
+    if !spec.assignment_node_types.is_empty() && spec.assignment_node_types.contains(&node.kind()) {
+        let Some(left) = resolve_write_lhs_node(node) else {
+            return;
+        };
+        let mut is_member = false;
+        let Some(name) = resolve_lhs_write_name(left, ctx.source, &mut is_member) else {
+            return;
+        };
+        if !name.is_empty() && !helpers::is_keyword(&name, ctx.language) {
+            ctx.result.rw.push(ReadWrite {
+                var_name: name,
+                enclosing_func_qn: func_qn.to_string(),
+                is_write: true,
+                is_member_access: is_member,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

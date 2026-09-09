@@ -188,6 +188,16 @@ fn process_node(
     }
 }
 
+/// Unified-walk single-node handler (C handle_type_assigns).
+pub fn extract_type_assigns_at(
+    ctx: &mut ExtractCtx<'_>,
+    node: tree_sitter::Node<'_>,
+    spec: &LanguageSpec,
+    func_qn: &str,
+) {
+    process_node(ctx, node, spec, func_qn);
+}
+
 /// Walk AST (C walk_type_assigns): every node's enclosing QN via the cache.
 pub fn extract_type_assigns(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
     let mut stack = vec![ctx.root];

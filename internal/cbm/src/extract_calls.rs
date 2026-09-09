@@ -78,6 +78,13 @@ impl StringConstantMap {
 
 /// JS/TS template literal flatten (`/things/${id}` → `/things/{}`)
 /// (C cbm_template_string_text, #1006).
+pub fn template_string_text_public<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &'a str,
+) -> Option<String> {
+    template_string_text(node, source)
+}
+
 fn template_string_text<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
     let mut out = String::new();
     for i in 0..node.named_child_count() {
@@ -234,7 +241,7 @@ fn first_identifier_child<'t>(node: tree_sitter::Node<'t>) -> Option<tree_sitter
 
 /// Definition-role containers are not calls (C call_node_is_definition_container,
 /// main languages only here: Elixir def/defp via `call` nodes).
-fn is_definition_container(lang: Language, node: tree_sitter::Node<'_>, source: &str) -> bool {
+pub fn is_definition_container(lang: Language, node: tree_sitter::Node<'_>, source: &str) -> bool {
     if lang == Language::ELIXIR && node.kind() == "call" {
         if let Some(head) = node.child_by_field_name("kernel") {
             let t = crate::fqn::node_text(head, source);

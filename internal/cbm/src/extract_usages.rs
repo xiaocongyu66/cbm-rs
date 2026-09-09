@@ -17,7 +17,7 @@ use crate::Language;
 // ── Binding tables (verbatim from C) ────────────────────────────
 
 /// Declaration containers that bind their name/pattern wholesale.
-const COMMON_WHOLE_BINDING_NODES: &[&str] = &[
+pub const COMMON_WHOLE_BINDING_NODES: &[&str] = &[
     "formal_parameter",
     "formal_parameters",
     "parameter",
@@ -97,6 +97,14 @@ fn is_value_field(field: Option<&str>) -> bool {
                 | "result"
         )
     )
+}
+
+pub fn common_whole_binding_nodes() -> &'static [&'static str] {
+    COMMON_WHOLE_BINDING_NODES
+}
+
+pub fn read_write_nodes() -> &'static [&'static str] {
+    READ_WRITE_NODES
 }
 
 // ── Reference node classification (C is_reference_node) ────────
@@ -229,6 +237,29 @@ fn field_name_for_node(
 }
 
 /// Is `parent` a binding container whose `binding_field` holds `node`?
+pub fn declared_container_binds_public(
+    parent: tree_sitter::Node<'_>,
+    spec: &LanguageSpec,
+    node: tree_sitter::Node<'_>,
+) -> bool {
+    declared_container_binds(parent, spec, node)
+}
+
+pub fn is_call_interior_public(node: tree_sitter::Node<'_>) -> bool {
+    // Part 1 approximation: the standalone walker's inside-call check walks
+    // ancestors for a call container. The unified walker tracks call depth;
+    // the C's invocation-triple suppression (exact callee consumption) lands
+    // with lexical bindings.
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if matches!(p.kind(), "call" | "call_expression") {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
 fn declared_container_binds(
     parent: tree_sitter::Node<'_>,
     spec: &LanguageSpec,
@@ -289,7 +320,7 @@ pub fn is_binding_occurrence(
 // ── Write classification (C assignment_reads_target +
 //    is_write_occurrence STANDARD path) ─────────────────────────
 
-const READ_WRITE_NODES: &[&str] = &[
+pub const READ_WRITE_NODES: &[&str] = &[
     "augmented_assignment",
     "augmented_assignment_expression",
     "compound_assignment_expr",
@@ -307,7 +338,7 @@ const READ_WRITE_OPERATORS: &[&str] = &[
 
 /// `+=`/`++`-shaped assignments READ their target as well as write it
 /// (C assignment_reads_target).
-fn assignment_reads_target(assignment: tree_sitter::Node<'_>) -> bool {
+pub fn assignment_reads_target(assignment: tree_sitter::Node<'_>) -> bool {
     if READ_WRITE_NODES.contains(&assignment.kind()) {
         return true;
     }

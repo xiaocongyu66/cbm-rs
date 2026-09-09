@@ -47,9 +47,20 @@ pub struct ExtractCtx<'t> {
     pub ef_cache: fqn::EnclosingQnCache<'t>,
     /// Accumulated result (C ctx->result).
     pub result: FileResult,
+    /// Module-level string constants (C string_constants map):
+    /// (name, value, is_url_builder). Filled by the unified walk's
+    /// handle_string_constants / handle_url_builders.
+    pub constants: Vec<(String, String, bool)>,
 }
 
 impl<'t> ExtractCtx<'t> {
+    /// Snapshot as the lookup map extract_calls reads.
+    pub fn constants_map(&self) -> crate::extract_calls::StringConstantMap {
+        crate::extract_calls::StringConstantMap {
+            entries: self.constants.clone(),
+        }
+    }
+
     pub fn new(
         source: &'t str,
         root: tree_sitter::Node<'t>,
@@ -67,6 +78,7 @@ impl<'t> ExtractCtx<'t> {
             module_qn,
             ef_cache: fqn::EnclosingQnCache::new(),
             result: FileResult::default(),
+            constants: Vec::new(),
         }
     }
 }
@@ -156,6 +168,32 @@ fn is_env_var_name(s: &str) -> bool {
         }
     }
     has_upper
+}
+
+/// Unified-walk single-node handler (C unified env handler): process one
+/// node at the walk's QN; the unified walk supplies traversal.
+pub fn extract_env_accesses_at(
+    ctx: &mut ExtractCtx<'_>,
+    node: tree_sitter::Node<'_>,
+    spec: &LanguageSpec,
+    func_qn: &str,
+) {
+    let kind = node.kind();
+    let mut env_key: Option<&str> = None;
+    if spec.call_node_types.contains(&kind) {
+        env_key = env_key_from_call(node, ctx.source, spec);
+    }
+    if env_key.is_none() && matches!(kind, "member_expression" | "subscript" | "attribute") {
+        env_key = env_key_from_member(node, ctx.source, spec);
+    }
+    if let Some(key) = env_key {
+        if !key.is_empty() && is_env_var_name(key) {
+            ctx.result.env_accesses.push(EnvAccess {
+                env_key: key.to_string(),
+                enclosing_func_qn: func_qn.to_string(),
+            });
+        }
+    }
 }
 
 /// Walk the AST collecting env accesses (C walk_env_accesses).
