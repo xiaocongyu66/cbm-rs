@@ -3,6 +3,7 @@
 //! The 162 grammar_*.c glue files become crates.io tree-sitter grammar
 //! crates; ts_runtime becomes the tree-sitter Rust runtime.
 
+pub mod ac;
 pub mod ast_profile;
 pub mod extract_calls;
 pub mod extract_dbt;
