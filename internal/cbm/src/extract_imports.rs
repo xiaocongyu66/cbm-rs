@@ -29,16 +29,15 @@ fn path_last(path: &str) -> &str {
         .rev()
         .find(|(_, c)| matches!(c, '/' | '.' | ':' | '\\'));
     match last_sep {
-        Some((i, c)) if c == ':' => {
+        Some((i, _)) => {
             // '::' counts as one separator: skip the second colon too.
             let after = i + 1;
-            if path.as_bytes().get(after) == Some(&b':') {
+            if path.as_bytes().get(i) == Some(&b':') && path.as_bytes().get(after) == Some(&b':') {
                 &path[after + 1..]
             } else {
                 &path[i + 1..]
             }
         }
-        Some((i, _)) => &path[i + 1..],
         None => path,
     }
 }
@@ -81,8 +80,7 @@ fn parse_go_import_spec(ctx: &mut ExtractCtx<'_>, spec: tree_sitter::Node<'_>) {
 /// Top-level import_declaration walk (C parse_go_imports).
 fn parse_go_imports(ctx: &mut ExtractCtx<'_>) {
     let root = ctx.root;
-    let mut cursor_guard = root.walk();
-    let mut cursor = &mut cursor_guard;
+    let mut cursor = root.walk();
     if !cursor.goto_first_child() {
         return;
     }
@@ -251,8 +249,7 @@ fn process_py_import_from(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>)
 /// Python walk: top-level import statements (C parse_python_imports).
 fn parse_python_imports(ctx: &mut ExtractCtx<'_>) {
     let root = ctx.root;
-    let mut cursor_guard = root.walk();
-    let cursor = &mut cursor_guard;
+    let mut cursor = root.walk();
     if !cursor.goto_first_child() {
         return;
     }
@@ -480,8 +477,7 @@ fn walk_es_imports(ctx: &mut ExtractCtx<'_>, root: tree_sitter::Node<'_>) {
 /// Top-level import_declarations (C parse_java_imports).
 fn parse_java_imports(ctx: &mut ExtractCtx<'_>) {
     let root = ctx.root;
-    let mut cursor_guard = root.walk();
-    let cursor = &mut cursor_guard;
+    let mut cursor = root.walk();
     if !cursor.goto_first_child() {
         return;
     }
@@ -511,8 +507,7 @@ fn parse_java_imports(ctx: &mut ExtractCtx<'_>) {
 /// use_declarations (C parse_rust_imports): strip "use " and trailing ';'.
 fn parse_rust_imports(ctx: &mut ExtractCtx<'_>) {
     let root = ctx.root;
-    let mut cursor_guard = root.walk();
-    let cursor = &mut cursor_guard;
+    let mut cursor = root.walk();
     if !cursor.goto_first_child() {
         return;
     }
@@ -555,8 +550,7 @@ fn capture_namespace_decl(ctx: &mut ExtractCtx<'_>) {
         "name",
     ];
     let root = ctx.root;
-    let mut cursor_guard = root.walk();
-    let cursor = &mut cursor_guard;
+    let mut cursor = root.walk();
     if !cursor.goto_first_child() {
         return;
     }
