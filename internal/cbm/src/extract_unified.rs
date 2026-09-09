@@ -313,7 +313,7 @@ fn push_boundary_scopes(
             .child_by_field_name("name")
             .map(|n| {
                 let cname = crate::fqn::node_text(n, ctx.source);
-                crate::fqn::fqn_compute(ctx.project, ctx.rel_path, Some(&cname))
+                crate::fqn::fqn_compute(ctx.project, ctx.rel_path, Some(cname))
             })
             .unwrap_or_else(|| ctx.module_qn.clone());
         state.push_scope(SCOPE_CLASS, depth, Some(cqn));
