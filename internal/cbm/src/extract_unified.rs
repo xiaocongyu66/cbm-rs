@@ -20,18 +20,18 @@ use crate::Language;
 // The verbatim SCOPE_* table (C extract_unified.h). LEXICAL/NAMESPACE are
 // consumed by specialized lexical-scope paths landing in a later part.
 #[allow(dead_code)]
-const SCOPE_FUNC: u8 = 1;
+pub(crate) const SCOPE_FUNC: u8 = 1;
 #[allow(dead_code)]
-const SCOPE_CLASS: u8 = 2;
+pub(crate) const SCOPE_CLASS: u8 = 2;
 #[allow(dead_code)]
-const SCOPE_CALL: u8 = 3;
-const SCOPE_IMPORT: u8 = 4;
-const SCOPE_LOOP: u8 = 5;
-const SCOPE_BRANCH: u8 = 6;
+pub(crate) const SCOPE_CALL: u8 = 3;
+pub(crate) const SCOPE_IMPORT: u8 = 4;
+pub(crate) const SCOPE_LOOP: u8 = 5;
+pub(crate) const SCOPE_BRANCH: u8 = 6;
 #[allow(dead_code)]
-const SCOPE_LEXICAL: u8 = 7;
+pub(crate) const SCOPE_LEXICAL: u8 = 7;
 #[allow(dead_code)]
-const SCOPE_NAMESPACE: u8 = 8;
+pub(crate) const SCOPE_NAMESPACE: u8 = 8;
 
 /// Loop node types (C cbm_is_loop_node_type). Loops are gated on named
 /// nodes so anonymous `for`/`while` keyword tokens don't count.
@@ -130,7 +130,7 @@ pub struct WalkState {
 }
 
 impl WalkState {
-    fn new(module_qn: &str) -> Self {
+    pub(crate) fn new(module_qn: &str) -> Self {
         WalkState {
             enclosing_func_qn: module_qn.to_string(),
             enclosing_class_qn: None,
@@ -147,7 +147,7 @@ impl WalkState {
 
     /// Current innermost lexical scope id (C current_lexical_scope_id): the
     /// topmost frame that carries one, else the root.
-    fn current_lexical_scope_id(&self) -> u32 {
+    pub fn current_lexical_scope_id(&self) -> u32 {
         for id in self.frame_lexical_ids.iter().rev() {
             if *id != 0 {
                 return *id;
@@ -210,14 +210,14 @@ impl WalkState {
         id
     }
 
-    fn lexical_scope_by_id(&self, id: u32) -> Option<&LexicalScope> {
+    pub fn lexical_scope_by_id(&self, id: u32) -> Option<&LexicalScope> {
         self.lexical_scopes.get(id.wrapping_sub(1) as usize)
     }
 
     /// Push a scope frame that also opens a concrete lexical scope (C
     /// push_lexical_scope). Returns the new lexical scope id (0 on cap
     /// failure — the caller fails closed).
-    fn push_lexical_scope(
+    pub(crate) fn push_lexical_scope(
         &mut self,
         kind: u8,
         depth: u32,
@@ -252,7 +252,7 @@ impl WalkState {
 
     /// Push a scope frame: save the displaced tuple, apply the frame's
     /// effect (C push_scope).
-    fn push_scope(&mut self, kind: u8, depth: u32, qn: Option<String>) -> bool {
+    pub(crate) fn push_scope(&mut self, kind: u8, depth: u32, qn: Option<String>) -> bool {
         if self.scopes.len() >= 64 {
             return false; // MAX_SCOPES
         }
@@ -287,7 +287,7 @@ impl WalkState {
 
     /// Pop scopes ascended out of (depth >= current cursor depth),
     /// restoring the displaced tuple LIFO (C pop_expired_scopes).
-    fn pop_expired_scopes(&mut self, cur_depth: u32) {
+    pub(crate) fn pop_expired_scopes(&mut self, cur_depth: u32) {
         while let Some(f) = self.scopes.last() {
             if f.depth < cur_depth {
                 break;

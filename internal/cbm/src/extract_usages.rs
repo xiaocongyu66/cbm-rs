@@ -1528,6 +1528,484 @@ pub fn is_policy_binding(node: tree_sitter::Node<'_>, lang: Language, source: &s
     }
 }
 
+// ── Lexical bindings (C record_lexical_binding / finalize) ──────
+
+/// Deferred binding event (C CBMLexicalBinding): applying these after the
+/// walk represents hoisted and whole-scope rules without depending on
+/// traversal order.
+#[derive(Debug, Clone)]
+pub struct LexicalBinding {
+    pub scope_id: u32,
+    /// Zero means "the finalized end of this concrete scope".
+    pub active_start: u32,
+    pub active_end: u32,
+    pub name: String,
+}
+
+/// Python global/nonlocal directives recorded per function scope (C
+/// CBMPythonDirective).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonDirective {
+    Global,
+    Nonlocal,
+}
+
+fn binding_is_parameter(node: tree_sitter::Node<'_>, spec: &LanguageSpec, lang: Language) -> bool {
+    let occurrence = crate::extract_usages::occurrence_spec(lang);
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        let kind = p.kind();
+        if COMMON_WHOLE_BINDING_NODES.contains(&kind)
+            || occurrence.whole_binding_nodes.contains(&kind)
+        {
+            return true;
+        }
+        if !spec.function_node_types.is_empty() && spec.function_node_types.contains(&kind) {
+            return field_contains_node(p, "parameter", node)
+                || field_contains_node(p, "parameters", node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn lexical_identifier_case_insensitive(lang: Language) -> bool {
+    matches!(
+        lang,
+        Language::POWERSHELL
+            | Language::FORTRAN
+            | Language::ADA
+            | Language::PASCAL
+            | Language::COBOL
+            | Language::VHDL
+    )
+}
+
+/// Binding key normalization (C lexical_binding_key): Tcl unwraps its
+/// reference sigil; case-insensitive languages fold to lowercase.
+pub fn lexical_binding_key(name: &str, lang: Language) -> String {
+    let name = if lang == Language::TCL {
+        name.strip_prefix('$').unwrap_or(name)
+    } else {
+        name
+    };
+    if lexical_identifier_case_insensitive(lang) {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
+fn js_var_binding(node: tree_sitter::Node<'_>) -> bool {
+    // var hoists to the nearest FUNCTION scope; let/const bind the BLOCK.
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        match p.kind() {
+            "variable_declaration" => return true,
+            "lexical_declaration" => return false,
+            _ => {}
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+/// Scope-walk helper (C lexical_ancestor_of_kind): nearest ancestor scope
+/// that is a function/comprehension (want_function) or block (want_block).
+pub fn lexical_ancestor_of_kind(
+    scopes: &[crate::extract_unified::LexicalScope],
+    start_id: u32,
+    want_function: bool,
+    want_block: bool,
+) -> u32 {
+    let mut id = start_id;
+    let mut remaining = scopes.len();
+    while id != 0 && remaining > 0 {
+        remaining -= 1;
+        let Some(scope) = scopes.get(id.wrapping_sub(1) as usize) else {
+            return 0;
+        };
+        use crate::extract_unified::LexicalScopeKind as K;
+        let is_function = matches!(scope.kind, K::Function | K::Comprehension);
+        let is_block = scope.kind == K::Block;
+        if (want_function && is_function) || (want_block && is_block) {
+            return id;
+        }
+        id = scope.parent_id;
+    }
+    0
+}
+
+/// Python structural namespace walk (C python_nearest_namespace): module,
+/// function, comprehension, or class — whichever comes first.
+fn python_nearest_namespace(scopes: &[crate::extract_unified::LexicalScope], start_id: u32) -> u32 {
+    use crate::extract_unified::LexicalScopeKind as K;
+    let mut id = start_id;
+    let mut remaining = scopes.len();
+    while id != 0 && remaining > 0 {
+        remaining -= 1;
+        let Some(scope) = scopes.get(id.wrapping_sub(1) as usize) else {
+            return 0;
+        };
+        if matches!(
+            scope.kind,
+            K::Function | K::Comprehension | K::Class | K::Module
+        ) {
+            return id;
+        }
+        id = scope.parent_id;
+    }
+    0
+}
+
+fn python_enclosing_function_namespace(
+    scopes: &[crate::extract_unified::LexicalScope],
+    inner_function_id: u32,
+) -> u32 {
+    use crate::extract_unified::LexicalScopeKind as K;
+    let inner = scopes.get(inner_function_id.wrapping_sub(1) as usize);
+    let mut id = inner.map(|s| s.parent_id).unwrap_or(0);
+    let mut remaining = scopes.len();
+    while id != 0 && remaining > 0 {
+        remaining -= 1;
+        let Some(scope) = scopes.get(id.wrapping_sub(1) as usize) else {
+            return 0;
+        };
+        if matches!(scope.kind, K::Function | K::Comprehension) {
+            return id;
+        }
+        id = scope.parent_id;
+    }
+    0
+}
+
+fn declared_function_name_owner<'t>(
+    node: tree_sitter::Node<'t>,
+    spec: &LanguageSpec,
+) -> Option<tree_sitter::Node<'t>> {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if !spec.function_node_types.is_empty() && spec.function_node_types.contains(&p.kind()) {
+            return field_contains_node(p, "name", node).then_some(p);
+        }
+        parent = p.parent();
+    }
+    None
+}
+
+fn declared_class_name_owner<'t>(
+    node: tree_sitter::Node<'t>,
+    spec: &LanguageSpec,
+) -> Option<tree_sitter::Node<'t>> {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if !spec.class_node_types.is_empty() && spec.class_node_types.contains(&p.kind()) {
+            return field_contains_node(p, "name", node).then_some(p);
+        }
+        parent = p.parent();
+    }
+    None
+}
+
+/// Recording state threaded through the unified walk (the C keeps these on
+/// WalkState; the Rust split keeps them in a dedicated struct the walker
+/// owns).
+#[derive(Debug, Default)]
+pub struct LexicalBindingTracker {
+    pub bindings: Vec<LexicalBinding>,
+    pub python_directives: Vec<(u32, String, PythonDirective)>,
+    pub tracking_failed: bool,
+    /// Index into the result's usages where the unified walk began.
+    pub usage_start_index: usize,
+}
+
+/// Record one binding occurrence against the walk's scope stack (C
+/// record_lexical_binding). Scope selection per language follows the C:
+/// declared function/class names bind the enclosing executable scope,
+/// parameters bind the function, Python consults global/nonlocal
+/// directives, JS splits var (function) from let/const (block), Rust
+/// imports are whole-scope items.
+#[allow(clippy::too_many_arguments)]
+pub fn record_lexical_binding(
+    tracker: &mut LexicalBindingTracker,
+    state: &mut crate::extract_unified::WalkState,
+    node: tree_sitter::Node<'_>,
+    spec: &LanguageSpec,
+    raw_name: &str,
+    import_binding: bool,
+    lang: Language,
+) {
+    if raw_name.is_empty() || tracker.tracking_failed {
+        return;
+    }
+    let parameter = binding_is_parameter(node, spec, lang);
+    let name = lexical_binding_key(raw_name, lang);
+    if name.is_empty() {
+        return;
+    }
+
+    let current_id = state.current_lexical_scope_id();
+    let mut scope_id;
+    let mut whole_scope = false;
+    let function_declaration = declared_function_name_owner(node, spec);
+    let class_declaration = declared_class_name_owner(node, spec);
+
+    use crate::extract_unified::LexicalScopeKind as K;
+
+    if let Some(func_node) = function_declaration {
+        let function_id = lexical_ancestor_of_kind(&state.lexical_scopes, current_id, true, false);
+        let parent_id = state
+            .lexical_scope_by_id(function_id)
+            .map(|s| s.parent_id)
+            .unwrap_or(0);
+        if lang == Language::PYTHON {
+            scope_id = python_nearest_namespace(&state.lexical_scopes, parent_id);
+            let owner_ok = state
+                .lexical_scope_by_id(scope_id)
+                .map(|s| matches!(s.kind, K::Function | K::Comprehension))
+                .unwrap_or(false);
+            if !owner_ok {
+                return;
+            }
+        } else {
+            scope_id = lexical_ancestor_of_kind(&state.lexical_scopes, parent_id, true, true);
+        }
+        // Top-level/class callable declarations are themselves semantic
+        // targets, not local-value blockers — only NESTED declarations
+        // bind (C: scope_id == 0 → return).
+        if scope_id == 0 {
+            return;
+        }
+        whole_scope = true;
+        let _ = func_node;
+    } else if lang == Language::PYTHON && class_declaration.is_some() {
+        let class_id = python_nearest_namespace(&state.lexical_scopes, current_id);
+        let class_parent = state
+            .lexical_scope_by_id(class_id)
+            .map(|s| s.parent_id)
+            .unwrap_or(0);
+        scope_id = python_nearest_namespace(&state.lexical_scopes, class_parent);
+        let owner_ok = state
+            .lexical_scope_by_id(scope_id)
+            .map(|s| matches!(s.kind, K::Function | K::Comprehension))
+            .unwrap_or(false);
+        if !owner_ok {
+            return;
+        }
+        whole_scope = true;
+    } else if parameter {
+        scope_id = lexical_ancestor_of_kind(&state.lexical_scopes, current_id, true, false);
+        whole_scope = true;
+    } else if lang == Language::PYTHON {
+        let namespace_id = python_nearest_namespace(&state.lexical_scopes, current_id);
+        let namespace_is_fn = state
+            .lexical_scope_by_id(namespace_id)
+            .map(|s| matches!(s.kind, K::Function | K::Comprehension))
+            .unwrap_or(false);
+        let function_id = if namespace_is_fn {
+            namespace_id
+        } else {
+            lexical_ancestor_of_kind(&state.lexical_scopes, current_id, true, false)
+        };
+        let directive = tracker
+            .python_directives
+            .iter()
+            .rev()
+            .find(|(fid, n, _)| *fid == function_id && n == &name)
+            .map(|(_, _, d)| *d);
+        scope_id = match directive {
+            Some(PythonDirective::Global) => state.root_lexical_scope_id,
+            Some(PythonDirective::Nonlocal) => {
+                python_enclosing_function_namespace(&state.lexical_scopes, function_id)
+            }
+            None => namespace_id,
+        };
+        let owner = state.lexical_scope_by_id(scope_id);
+        if owner.is_none() {
+            return;
+        }
+        whole_scope = directive.is_none()
+            && owner
+                .map(|s| matches!(s.kind, K::Function | K::Comprehension))
+                .unwrap_or(false);
+    } else if lang == Language::POWERSHELL {
+        scope_id = lexical_ancestor_of_kind(&state.lexical_scopes, current_id, true, false);
+        whole_scope = true;
+    } else if matches!(
+        lang,
+        Language::JAVASCRIPT | Language::TYPESCRIPT | Language::TSX | Language::ARKTS
+    ) {
+        let is_var = js_var_binding(node);
+        scope_id = lexical_ancestor_of_kind(&state.lexical_scopes, current_id, is_var, !is_var);
+        if scope_id == 0 {
+            scope_id = lexical_ancestor_of_kind(&state.lexical_scopes, current_id, true, false);
+        }
+        if scope_id == 0 {
+            scope_id = state.root_lexical_scope_id;
+        }
+        whole_scope = true; // var hoisting and let/const TDZ
+    } else if lang == Language::RUST && import_binding {
+        scope_id = lexical_import_scope(&state.lexical_scopes, current_id);
+        if scope_id == 0 {
+            scope_id = state.root_lexical_scope_id;
+        }
+        // A use/extern-crate declaration is an item in scope for the whole
+        // containing block/module, independent of declaration order.
+        whole_scope = true;
+    } else {
+        scope_id = lexical_ancestor_of_kind(&state.lexical_scopes, current_id, true, true);
+        if scope_id == 0 {
+            scope_id = state.root_lexical_scope_id;
+        }
+    }
+    let Some(scope) = state.lexical_scope_by_id(scope_id) else {
+        return;
+    };
+    tracker.bindings.push(LexicalBinding {
+        scope_id,
+        active_start: if whole_scope {
+            scope.start_byte
+        } else {
+            node.end_byte() as u32
+        },
+        active_end: 0,
+        name,
+    });
+}
+
+fn lexical_import_scope(scopes: &[crate::extract_unified::LexicalScope], start_id: u32) -> u32 {
+    use crate::extract_unified::LexicalScopeKind as K;
+    let mut id = start_id;
+    let mut remaining = scopes.len();
+    while id != 0 && remaining > 0 {
+        remaining -= 1;
+        let Some(scope) = scopes.get(id.wrapping_sub(1) as usize) else {
+            return 0;
+        };
+        if matches!(
+            scope.kind,
+            K::Module | K::Function | K::Comprehension | K::Block
+        ) {
+            return id;
+        }
+        id = scope.parent_id;
+    }
+    0
+}
+
+/// Record a Python global/nonlocal directive (C record_python_directive):
+/// last one wins per (function scope, name).
+pub fn record_python_directive(
+    tracker: &mut LexicalBindingTracker,
+    function_scope_id: u32,
+    name: &str,
+    kind: PythonDirective,
+) {
+    if function_scope_id == 0 || name.is_empty() {
+        return;
+    }
+    for entry in tracker.python_directives.iter_mut().rev() {
+        if entry.0 == function_scope_id && entry.1 == name {
+            entry.2 = kind;
+            return;
+        }
+    }
+    tracker
+        .python_directives
+        .push((function_scope_id, name.to_string(), kind));
+}
+
+/// Post-walk finalization (C cbm_finalize_lexical_usages): sort bindings,
+/// then flag every usage whose name is lexically bound and active at its
+/// site — semantic short-name resolution must not fabricate an edge past a
+/// local binding. Module-level bindings block only cross-file fallback, so
+/// they set blocked without the local-shadow bit.
+pub fn finalize_lexical_usages(
+    tracker: &LexicalBindingTracker,
+    state: &crate::extract_unified::WalkState,
+    usages: &mut [Usage],
+    lang: Language,
+) {
+    let mut bindings = tracker.bindings.clone();
+    bindings.sort_by(|l, r| {
+        l.scope_id
+            .cmp(&r.scope_id)
+            .then(l.name.cmp(&r.name))
+            .then(l.active_start.cmp(&r.active_start))
+            .then(l.active_end.cmp(&r.active_end))
+    });
+
+    use crate::extract_unified::LexicalScopeKind as K;
+    for usage in usages.iter_mut().skip(tracker.usage_start_index) {
+        if usage.ref_name.is_empty() {
+            continue;
+        }
+        let name = lexical_binding_key(&usage.ref_name, lang);
+        // Walk the lookup chain from the usage's scope.
+        let mut scope_id = usage.lexical_scope_id;
+        let mut hit_kind: Option<K> = None;
+        let mut remaining = state.lexical_scopes.len();
+        while scope_id != 0 && remaining > 0 {
+            remaining -= 1;
+            let Some(scope) = state.lexical_scope_by_id(scope_id) else {
+                break;
+            };
+            // Binary-search lower bound for (scope_id, name).
+            let mut low = 0usize;
+            let mut high = bindings.len();
+            while low < high {
+                let mid = (low + high) / 2;
+                let b = &bindings[mid];
+                let order = b
+                    .scope_id
+                    .cmp(&scope_id)
+                    .then(b.name.as_str().cmp(name.as_str()));
+                if order == std::cmp::Ordering::Less {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            let mut idx = low;
+            while idx < bindings.len() {
+                let b = &bindings[idx];
+                idx += 1;
+                if b.scope_id != scope_id || b.name != name {
+                    break;
+                }
+                let active_end = if b.active_end != 0 {
+                    b.active_end
+                } else {
+                    scope.end_byte
+                };
+                if b.active_start <= usage.site_start_byte && usage.site_start_byte < active_end {
+                    hit_kind = Some(scope.kind);
+                    break;
+                }
+            }
+            if hit_kind.is_some() {
+                break;
+            }
+            scope_id = scope.lookup_parent_id;
+        }
+        if let Some(kind) = hit_kind {
+            usage.semantic_reference_blocked = true;
+            usage.semantic_reference_local_shadow = kind != K::Module;
+        }
+    }
+
+    // Allocation failure must never widen textual fallback: fail closed.
+    if tracker.tracking_failed {
+        for usage in usages.iter_mut().skip(tracker.usage_start_index) {
+            usage.semantic_reference_blocked = true;
+            let kind = state
+                .lexical_scope_by_id(usage.lexical_scope_id)
+                .map(|s| s.kind);
+            usage.semantic_reference_local_shadow = kind.map(|k| k != K::Module).unwrap_or(false);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1775,5 +2253,172 @@ mod tests {
         // The body read is NOT a binding.
         let body = find_under("declaration");
         assert!(!is_exact_language_binding(body, Language::SCSS, src));
+    }
+
+    // ── Lexical binding recording + finalization ──
+
+    #[test]
+    fn python_lookup_bypasses_class_scope() {
+        // Class scope (2) → function (3): Python function lookup parent
+        // must be the module (1), not the class.
+        let tree = crate::ts::parse(
+            Language::PYTHON,
+            "class C:\n    def m(self):\n        pass\n",
+        )
+        .unwrap();
+        let node = tree.root_node();
+        let mut state = crate::extract_unified::WalkState::new("p.f");
+        state.push_lexical_scope(
+            crate::extract_unified::SCOPE_LEXICAL,
+            0,
+            None,
+            node,
+            crate::extract_unified::LexicalScopeKind::Module,
+            Language::PYTHON,
+        );
+        let class_id = state.push_lexical_scope(
+            crate::extract_unified::SCOPE_LEXICAL,
+            1,
+            None,
+            node,
+            crate::extract_unified::LexicalScopeKind::Class,
+            Language::PYTHON,
+        );
+        let func_id = state.push_lexical_scope(
+            crate::extract_unified::SCOPE_LEXICAL,
+            2,
+            None,
+            node,
+            crate::extract_unified::LexicalScopeKind::Function,
+            Language::PYTHON,
+        );
+        let func = state.lexical_scope_by_id(func_id).unwrap();
+        assert_eq!(func.parent_id, class_id);
+        assert_eq!(func.lookup_parent_id, 1);
+    }
+
+    #[test]
+    fn finalize_blocks_shadowed_names() {
+        // A usage at byte 50 of "count", bound at byte 40 in a function
+        // scope whose body extends past it → blocked + local shadow.
+        use crate::extract_unified::{LexicalScope, LexicalScopeKind};
+        let mut state = crate::extract_unified::WalkState::new("p.f");
+        state.lexical_scopes.push(LexicalScope {
+            id: 1,
+            parent_id: 0,
+            lookup_parent_id: 0,
+            start_byte: 30,
+            end_byte: 100,
+            kind: LexicalScopeKind::Function,
+        });
+        state.lexical_scopes.push(LexicalScope {
+            id: 2,
+            parent_id: 0,
+            lookup_parent_id: 0,
+            start_byte: 0,
+            end_byte: 200,
+            kind: LexicalScopeKind::Module,
+        });
+        let mut tracker = LexicalBindingTracker {
+            usage_start_index: 0,
+            ..Default::default()
+        };
+        tracker.bindings.push(LexicalBinding {
+            scope_id: 1,
+            active_start: 40,
+            active_end: 0, // finalized = scope end
+            name: "count".into(),
+        });
+        let mut usages = vec![
+            Usage {
+                ref_name: "count".into(),
+                lexical_scope_id: 1,
+                site_start_byte: 50,
+                ..Default::default()
+            },
+            Usage {
+                ref_name: "count".into(),
+                lexical_scope_id: 2,
+                site_start_byte: 150,
+                ..Default::default()
+            },
+        ];
+        finalize_lexical_usages(&tracker, &state, &mut usages, Language::PYTHON);
+        assert!(
+            usages[0].semantic_reference_blocked,
+            "in-scope binding blocks"
+        );
+        assert!(
+            usages[0].semantic_reference_local_shadow,
+            "function scope is a local shadow"
+        );
+        assert!(
+            !usages[1].semantic_reference_blocked,
+            "module scope never sees the function binding"
+        );
+    }
+
+    #[test]
+    fn finalize_respects_active_start() {
+        // Binding becomes active only at its declaration site end
+        // (TDZ/use-before-decl): a usage BEFORE active_start is not blocked.
+        use crate::extract_unified::{LexicalScope, LexicalScopeKind};
+        let mut state = crate::extract_unified::WalkState::new("p.f");
+        state.lexical_scopes.push(LexicalScope {
+            id: 1,
+            parent_id: 0,
+            lookup_parent_id: 0,
+            start_byte: 0,
+            end_byte: 100,
+            kind: LexicalScopeKind::Function,
+        });
+        let mut tracker = LexicalBindingTracker::default();
+        tracker.bindings.push(LexicalBinding {
+            scope_id: 1,
+            active_start: 60,
+            active_end: 0,
+            name: "later".into(),
+        });
+        let mut usages = vec![
+            Usage {
+                ref_name: "later".into(),
+                lexical_scope_id: 1,
+                site_start_byte: 10,
+                ..Default::default()
+            },
+            Usage {
+                ref_name: "later".into(),
+                lexical_scope_id: 1,
+                site_start_byte: 70,
+                ..Default::default()
+            },
+        ];
+        finalize_lexical_usages(&tracker, &state, &mut usages, Language::JAVASCRIPT);
+        assert!(
+            !usages[0].semantic_reference_blocked,
+            "use before declaration"
+        );
+        assert!(
+            usages[1].semantic_reference_blocked,
+            "use after declaration"
+        );
+    }
+
+    #[test]
+    fn python_directive_last_wins() {
+        let mut tracker = LexicalBindingTracker::default();
+        record_python_directive(&mut tracker, 5, "x", PythonDirective::Global);
+        record_python_directive(&mut tracker, 5, "x", PythonDirective::Nonlocal);
+        assert_eq!(tracker.python_directives.len(), 1);
+        assert_eq!(tracker.python_directives[0].2, PythonDirective::Nonlocal);
+    }
+
+    #[test]
+    fn binding_key_normalization() {
+        // Tcl unwraps the sigil; case-insensitive languages fold.
+        assert_eq!(lexical_binding_key("$watched", Language::TCL), "watched");
+        assert_eq!(lexical_binding_key("$watched", Language::PERL), "$watched");
+        assert_eq!(lexical_binding_key("$Var", Language::POWERSHELL), "$var");
+        assert_eq!(lexical_binding_key("Camel", Language::PYTHON), "Camel");
     }
 }
