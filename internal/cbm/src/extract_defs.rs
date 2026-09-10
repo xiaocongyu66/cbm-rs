@@ -866,62 +866,1162 @@ fn extract_body_ident_tokens(body: tree_sitter::Node<'_>, source: &str) -> Optio
     }
 }
 
-// ── Module-level variable extraction (C extract_variables, main shape) ──
+// ═══ Variable extraction layer (C extract_var_names + helpers) ═══
+//
+// C lives in extract_defs.c 5372-6326 + helpers.c module-parents tables.
+// The Rust walk registered only direct `name`-field children; this layer
+// replaces that with the C's full per-language dispatch.
 
-/// Module-level variables: top-level variable-declaration children whose
-/// variable_declarator binds a name (C extract_variables main loop).
-pub fn extract_variables(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
-    if spec.variable_node_types.is_empty() {
+// ── Module-level parent tables (C module_parents_*) ─────────────
+
+const MODULE_PARENTS_GO: &[&str] = &["source_file"];
+const MODULE_PARENTS_RUST: &[&str] = &["source_file", "mod_item"];
+const MODULE_PARENTS_JAVA: &[&str] = &["program", "class_body"];
+const MODULE_PARENTS_KOTLIN: &[&str] = &["source_file", "class_body"];
+const MODULE_PARENTS_SCALA: &[&str] = &["compilation_unit", "template_body"];
+const MODULE_PARENTS_CSHARP: &[&str] = &[
+    "compilation_unit",
+    "class_declaration",
+    "namespace_declaration",
+];
+const MODULE_PARENTS_PHP: &[&str] = &["program"];
+const MODULE_PARENTS_RUBY: &[&str] = &["program", "class", "module"];
+const MODULE_PARENTS_C: &[&str] = &["translation_unit"];
+const MODULE_PARENTS_ZIG: &[&str] = &["source_file"];
+const MODULE_PARENTS_BASH: &[&str] = &["program"];
+const MODULE_PARENTS_ERLANG: &[&str] = &["source", "source_file"];
+const MODULE_PARENTS_HASKELL: &[&str] = &["declarations"];
+const MODULE_PARENTS_OCAML: &[&str] = &["compilation_unit"];
+const MODULE_PARENTS_ELIXIR: &[&str] = &["source"];
+const MODULE_PARENTS_HTML: &[&str] = &["document"];
+const MODULE_PARENTS_CSS: &[&str] = &["stylesheet"];
+const MODULE_PARENTS_SQL: &[&str] = &["source_file", "program", "statement"];
+const MODULE_PARENTS_TOML: &[&str] = &["document", "table", "table_array_element"];
+const MODULE_PARENTS_CONFIG: &[&str] = &[
+    "document",
+    "table",
+    "table_array_element",
+    "section",
+    "object",
+    "element",
+    "array",
+];
+const MODULE_PARENTS_HCL: &[&str] = &["config_file"];
+const MODULE_PARENTS_MAKEFILE: &[&str] = &["makefile"];
+const MODULE_PARENTS_COMMONLISP: &[&str] = &["source"];
+const MODULE_PARENTS_MATLAB: &[&str] = &["source_file"];
+const MODULE_PARENTS_FORM: &[&str] = &["source_file"];
+const MODULE_PARENTS_MAGMA: &[&str] = &["source_file"];
+/// tree-sitter-properties roots at `file`.
+const MODULE_PARENTS_PROPERTIES: &[&str] = &["file", "source_file"];
+
+fn module_parents(lang: Language) -> Option<&'static [&'static str]> {
+    Some(match lang {
+        Language::GO => MODULE_PARENTS_GO,
+        Language::RUST => MODULE_PARENTS_RUST,
+        Language::JAVA => MODULE_PARENTS_JAVA,
+        Language::KOTLIN => MODULE_PARENTS_KOTLIN,
+        Language::SCALA => MODULE_PARENTS_SCALA,
+        Language::CSHARP => MODULE_PARENTS_CSHARP,
+        Language::PHP => MODULE_PARENTS_PHP,
+        Language::RUBY => MODULE_PARENTS_RUBY,
+        Language::C | Language::CPP | Language::OBJC => MODULE_PARENTS_C,
+        Language::ZIG => MODULE_PARENTS_ZIG,
+        Language::BASH => MODULE_PARENTS_BASH,
+        Language::ERLANG => MODULE_PARENTS_ERLANG,
+        Language::HASKELL => MODULE_PARENTS_HASKELL,
+        Language::OCAML => MODULE_PARENTS_OCAML,
+        Language::ELIXIR => MODULE_PARENTS_ELIXIR,
+        Language::HTML => MODULE_PARENTS_HTML,
+        Language::CSS | Language::SCSS => MODULE_PARENTS_CSS,
+        Language::SQL => MODULE_PARENTS_SQL,
+        Language::TOML => MODULE_PARENTS_TOML,
+        Language::HCL => MODULE_PARENTS_HCL,
+        Language::JSON | Language::INI | Language::XML | Language::MARKDOWN => {
+            MODULE_PARENTS_CONFIG
+        }
+        Language::SWIFT => MODULE_PARENTS_ZIG,
+        Language::DART => MODULE_PARENTS_PHP,
+        Language::PERL | Language::GROOVY | Language::DOCKERFILE => MODULE_PARENTS_ZIG,
+        Language::R => MODULE_PARENTS_PHP,
+        Language::MAKEFILE => MODULE_PARENTS_MAKEFILE,
+        Language::COMMONLISP => MODULE_PARENTS_COMMONLISP,
+        Language::MATLAB => MODULE_PARENTS_MATLAB,
+        Language::LEAN => MODULE_PARENTS_ZIG,
+        Language::FORM => MODULE_PARENTS_FORM,
+        Language::MAGMA => MODULE_PARENTS_MAGMA,
+        Language::PROPERTIES => MODULE_PARENTS_PROPERTIES,
+        Language::GOMOD => MODULE_PARENTS_ZIG,
+        _ => return None,
+    })
+}
+
+/// Scripting wrapper pattern: parent matches root_kind directly, or
+/// matches wrapper_kind with a root_kind grandparent (C
+/// check_script_module_level).
+fn check_script_module_level(
+    parent: tree_sitter::Node<'_>,
+    root_kind: &str,
+    wrapper_kind: &str,
+) -> bool {
+    if parent.kind() == root_kind {
+        return true;
+    }
+    if parent.kind() == wrapper_kind {
+        return parent
+            .parent()
+            .map(|gp| gp.kind() == root_kind)
+            .unwrap_or(false);
+    }
+    false
+}
+
+/// Is this node's PARENT a module-level container? (C
+/// cbm_is_module_level_p; the parent is passed directly to avoid the O(n)
+/// ts_node_parent rescan that went quadratic on generated files.)
+pub fn is_module_level_p(parent: tree_sitter::Node<'_>, lang: Language) -> bool {
+    let pk = parent.kind();
+    // Wrapper-pattern scripting languages.
+    match lang {
+        Language::PYTHON => {
+            return check_script_module_level(parent, "module", "expression_statement")
+        }
+        Language::JAVASCRIPT | Language::TYPESCRIPT | Language::TSX | Language::ARKTS => {
+            return check_script_module_level(parent, "program", "export_statement")
+        }
+        Language::LUA => return check_script_module_level(parent, "chunk", "assignment_statement"),
+        Language::YAML => {
+            return matches!(pk, "document" | "stream" | "block_mapping");
+        }
+        _ => {}
+    }
+    module_parents(lang)
+        .map(|ps| ps.contains(&pk))
+        .unwrap_or(false)
+}
+
+// ── Nix attrpath helpers (C cbm_nix_*) ──────────────────────────
+
+/// Strip one matching pair of surrounding double quotes (C
+/// cbm_nix_strip_attr_quotes).
+pub fn nix_strip_attr_quotes(text: &str) -> &str {
+    let b = text.as_bytes();
+    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        &text[1..text.len() - 1]
+    } else {
+        text
+    }
+}
+
+/// True when a segment contains a `${...}` interpolation and has no
+/// statically knowable name (C cbm_nix_attr_is_interpolated); bounded scan.
+pub fn nix_attr_is_interpolated(attr: tree_sitter::Node<'_>) -> bool {
+    const NIX_ATTR_SCAN_MAX: usize = 32;
+    let mut stack = vec![attr];
+    while let Some(cur) = stack.pop() {
+        if cur.kind() == "interpolation" {
+            return true;
+        }
+        for i in 0..cur.named_child_count() {
+            if stack.len() >= NIX_ATTR_SCAN_MAX {
+                break;
+            }
+            if let Some(c) = cur.named_child(i) {
+                stack.push(c);
+            }
+        }
+    }
+    false
+}
+
+/// The leaf segment of an attrpath — the name (C
+/// cbm_nix_attrpath_last_attr). `attr` is a FIELD in this grammar, so
+/// iterate named children rather than matching a type.
+pub fn nix_attrpath_last_attr(attrpath: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let n = attrpath.named_child_count();
+    if n == 0 {
+        return None;
+    }
+    attrpath.named_child(n - 1)
+}
+
+/// The scope prefix of an attrpath: every segment except the leaf,
+/// quote-stripped and dot-joined (C cbm_nix_attrpath_scope). None for a
+/// single-segment path or an interpolated leading segment.
+pub fn nix_attrpath_scope(attrpath: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let n = attrpath.named_child_count();
+    if n <= 1 {
+        return None;
+    }
+    let mut scope = String::new();
+    for i in 0..n - 1 {
+        let seg = attrpath.named_child(i)?;
+        if nix_attr_is_interpolated(seg) {
+            return None;
+        }
+        let seg_text = crate::fqn::node_text(seg, source);
+        if seg_text.is_empty() {
+            return None;
+        }
+        let seg_text = nix_strip_attr_quotes(seg_text);
+        if scope.is_empty() {
+            scope.push_str(seg_text);
+        } else {
+            scope.push('.');
+            scope.push_str(seg_text);
+        }
+    }
+    if scope.is_empty() {
+        None
+    } else {
+        Some(scope)
+    }
+}
+
+/// True when a Nix binding's value is an attribute set — the binding names
+/// a scope rather than defining a value (C cbm_nix_binding_is_attrset_scope).
+pub fn nix_binding_is_attrset_scope(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() != "binding" {
+        return false;
+    }
+    let Some(value) = node.child_by_field_name("expression") else {
+        return false;
+    };
+    matches!(
+        value.kind(),
+        "attrset_expression" | "rec_attrset_expression"
+    )
+}
+
+// ── push_var_def (C push_var_def_qn) ────────────────────────────
+
+fn push_var_def_qn(
+    ctx: &mut ExtractCtx<'_>,
+    name: &str,
+    qn_name: Option<&str>,
+    node: tree_sitter::Node<'_>,
+) {
+    if name.is_empty() || name == "_" {
         return;
     }
-    for i in 0..ctx.root.named_child_count() {
-        let Some(child) = ctx.root.named_child(i) else {
+    let mut def = Definition {
+        name: name.to_string(),
+        label: "Variable".to_string(),
+        file_path: ctx.rel_path.to_string(),
+        ..Default::default()
+    };
+    // Java/Go: directory-based module (package), so a Go package-level var
+    // in myapp/db/conn.go is proj.myapp.db.Var, matching its siblings.
+    def.qualified_name = crate::fqn::fqn_compute_source_lang(
+        ctx.project,
+        ctx.rel_path,
+        Some(qn_name.unwrap_or(name)),
+        ctx.language,
+    );
+    def.start_line = node.start_position().row as u32 + 1;
+    def.end_line = node.end_position().row as u32 + 1;
+    def.is_exported = helpers::is_exported(name, ctx.language);
+    ctx.result.definitions.push(def);
+}
+
+fn push_var_def(ctx: &mut ExtractCtx<'_>, name: &str, node: tree_sitter::Node<'_>) {
+    push_var_def_qn(ctx, name, None, node);
+}
+
+// ── Name extractors from declarator chains ──────────────────────
+
+/// C/C++/ObjC declarator chain: declaration → [init_declarator] →
+/// [pointer/reference_declarator]* → identifier (C
+/// extract_c_declarator_name).
+fn extract_c_declarator_name<'t>(decl: tree_sitter::Node<'t>, source: &'t str) -> Option<String> {
+    let mut declarator = decl.child_by_field_name("declarator")?;
+    let mut dk = declarator.kind();
+    if dk == "init_declarator" {
+        declarator = declarator.child_by_field_name("declarator")?;
+        dk = declarator.kind();
+    }
+    while dk == "pointer_declarator" || dk == "reference_declarator" {
+        declarator = declarator.child_by_field_name("declarator")?;
+        dk = declarator.kind();
+    }
+    (dk == "identifier").then(|| crate::fqn::node_text(declarator, source).to_string())
+}
+
+/// Java/C# field_declaration (declarator → name) (C
+/// extract_java_field_name).
+fn extract_java_field_name<'t>(field: tree_sitter::Node<'t>, source: &'t str) -> Option<String> {
+    let declarator = match field.child_by_field_name("declarator") {
+        Some(d) => d,
+        None => (0..field.named_child_count())
+            .filter_map(|i| field.named_child(i))
+            .find(|c| c.kind() == "variable_declarator")?,
+    };
+    let name = declarator.child_by_field_name("name")?;
+    Some(crate::fqn::node_text(name, source).to_string())
+}
+
+/// C# field_declaration with nested variable_declaration (C
+/// extract_csharp_vars).
+fn extract_csharp_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    if let Some(fname) = extract_java_field_name(node, ctx.source) {
+        push_var_def(ctx, &fname, node);
+        return;
+    }
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else {
             continue;
         };
-        let ck = child.kind();
-        if !spec.variable_node_types.contains(&ck) {
+        if child.kind() != "variable_declaration" {
             continue;
         }
-        // Decl container → its variable_declarator / declarator children.
-        let declarators: Vec<tree_sitter::Node<'_>> = if matches!(
-            ck,
-            "lexical_declaration" | "variable_declaration" | "const_declaration"
-        ) {
-            (0..child.named_child_count())
-                .filter_map(|j| child.named_child(j))
-                .filter(|d| d.kind() == "variable_declarator" || d.kind() == "init_declarator")
-                .collect()
-        } else {
-            vec![child]
-        };
-        for d in declarators {
-            let Some(name_node) = d.child_by_field_name("name") else {
+        for j in 0..child.named_child_count() {
+            let Some(decl) = child.named_child(j) else {
                 continue;
             };
-            let name = crate::fqn::node_text(name_node, ctx.source);
-            if name.is_empty() {
+            if decl.kind() != "variable_declarator" {
                 continue;
             }
-            let mut def = Definition {
-                name: name.to_string(),
-                label: "Variable".to_string(),
-                file_path: ctx.rel_path.to_string(),
-                ..Default::default()
-            };
-            def.qualified_name = crate::fqn::fqn_compute_source_lang(
-                ctx.project,
-                ctx.rel_path,
-                Some(name),
-                ctx.language,
-            );
-            def.start_line = d.start_position().row as u32 + 1;
-            def.end_line = d.end_position().row as u32 + 1;
-            def.is_exported = helpers::is_exported(name, ctx.language);
-            ctx.result.definitions.push(def);
+            if let Some(id) = decl
+                .child_by_field_name("name")
+                .or_else(|| crate::fqn::find_child_by_kind(decl, "identifier"))
+            {
+                let t = crate::fqn::node_text(id, ctx.source);
+                push_var_def(ctx, t, decl);
+            }
         }
     }
 }
 
+/// JS/TS destructuring + plain declarators (C extract_js_vars).
+fn extract_js_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    for i in 0..node.named_child_count() {
+        let Some(decl) = node.named_child(i) else {
+            continue;
+        };
+        if !matches!(decl.kind(), "variable_declarator" | "init_declarator") {
+            continue;
+        }
+        let Some(name_node) = decl.child_by_field_name("name") else {
+            continue;
+        };
+        if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+            // Destructuring: emit each bound identifier (C
+            // extract_destructured_vars).
+            for k in 0..name_node.named_child_count() {
+                if let Some(part) = name_node.named_child(k) {
+                    collect_destructured_names(ctx, part, node);
+                }
+            }
+            continue;
+        }
+        let name = crate::fqn::node_text(name_node, ctx.source);
+        if !name.is_empty() {
+            push_var_def(ctx, name, node);
+        }
+    }
+}
+
+/// Destructuring pattern members (C extract_destructured_vars).
+fn collect_destructured_names(
+    ctx: &mut ExtractCtx<'_>,
+    part: tree_sitter::Node<'_>,
+    site: tree_sitter::Node<'_>,
+) {
+    match part.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let name = crate::fqn::node_text(part, ctx.source);
+            if !name.is_empty() {
+                push_var_def(ctx, name, site);
+            }
+        }
+        "pair" | "pair_pattern" => {
+            // {key: binding} — the VALUE side is the local binding.
+            if let Some(value) = part.child_by_field_name("value") {
+                collect_destructured_names(ctx, value, site);
+            }
+        }
+        "rest_pattern" | "assignment_pattern" => {
+            for k in 0..part.named_child_count() {
+                if let Some(inner) = part.named_child(k) {
+                    collect_destructured_names(ctx, inner, site);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Python assignment LHS (C mainstream PYTHON arm): identifier or
+/// tuple/list unpacking.
+fn extract_python_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    let lt = left.kind();
+    if lt == "identifier" {
+        let name = crate::fqn::node_text(left, ctx.source);
+        push_var_def(ctx, name, node);
+    } else if matches!(lt, "pattern_list" | "tuple_pattern" | "list_pattern") {
+        // Tuple/list unpacking: `x, y = f()` — one Variable per unpacked
+        // identifier (#new_py_tuple_unpack).
+        for li in 0..left.named_child_count() {
+            if let Some(part) = left.named_child(li) {
+                if part.kind() == "identifier" {
+                    let name = crate::fqn::node_text(part, ctx.source);
+                    push_var_def(ctx, name, node);
+                }
+            }
+        }
+    }
+}
+
+/// Go var/const spec children (C mainstream GO arm). The crates.io
+/// grammar wraps grouped specs in a `var_spec_list` the C's vendored
+/// grammar lacked — descend one extra level when present.
+fn extract_go_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else {
+            continue;
+        };
+        if matches!(child.kind(), "var_spec" | "const_spec") {
+            push_go_spec(ctx, child);
+        } else if matches!(child.kind(), "var_spec_list" | "const_spec_list") {
+            for j in 0..child.named_child_count() {
+                if let Some(spec) = child.named_child(j) {
+                    if matches!(spec.kind(), "var_spec" | "const_spec") {
+                        push_go_spec(ctx, spec);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn push_go_spec(ctx: &mut ExtractCtx<'_>, child: tree_sitter::Node<'_>) {
+    if let Some(vname) = child.child_by_field_name("name") {
+        let name = crate::fqn::node_text(vname, ctx.source);
+        push_var_def(ctx, name, child);
+    }
+}
+
+/// PHP expression_statement assignments (C extract_php_vars): strip `$`.
+fn extract_php_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    if node.kind() != "expression_statement" {
+        return;
+    }
+    for j in 0..node.named_child_count() {
+        let Some(inner) = node.named_child(j) else {
+            continue;
+        };
+        if inner.kind() == "assignment_expression" {
+            if let Some(left) = inner.child_by_field_name("left") {
+                let name = crate::fqn::node_text(left, ctx.source);
+                let stripped = name.strip_prefix('$').unwrap_or(name);
+                if !stripped.is_empty() {
+                    push_var_def(ctx, stripped, node);
+                }
+            }
+        }
+    }
+}
+
+/// Lua assignment_statement with function-def filtering (C extract_lua_vars).
+fn extract_lua_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else {
+            continue;
+        };
+        if child.kind() != "assignment_statement" {
+            continue;
+        }
+        // `local function f()` / `f = function()` are Function defs.
+        if let Some(expr_list) = crate::fqn::find_child_by_kind(child, "expression_list") {
+            if expr_list.named_child_count() > 0 {
+                if let Some(val) = expr_list.named_child(0) {
+                    if val.kind() == "function_definition" {
+                        continue;
+                    }
+                }
+            }
+        }
+        let vars = child
+            .child_by_field_name("variables")
+            .or_else(|| crate::fqn::find_child_by_kind(child, "variable_list"));
+        if let Some(vars) = vars {
+            if vars.named_child_count() > 0 {
+                if let Some(first) = vars.named_child(0) {
+                    let name = crate::fqn::node_text(first, ctx.source);
+                    push_var_def(ctx, name, node);
+                }
+            }
+        }
+    }
+}
+
+/// Perl variable nodes and assignment LHS (C extract_perl_vars).
+fn is_perl_var_type(ck: &str) -> bool {
+    matches!(
+        ck,
+        "scalar_variable"
+            | "array_variable"
+            | "hash_variable"
+            | "variable_declarator"
+            | "scalar"
+            | "array"
+            | "hash"
+    )
+}
+
+fn extract_perl_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else {
+            continue;
+        };
+        let ck = child.kind();
+        if is_perl_var_type(ck) {
+            let name = crate::fqn::node_text(child, ctx.source);
+            let stripped = name.strip_prefix(['$', '@', '%']).unwrap_or(name);
+            push_var_def(ctx, stripped, node);
+            return;
+        }
+        if ck != "assignment_expression" {
+            continue;
+        }
+        let mut left = child
+            .child_by_field_name("left")
+            .or_else(|| child.named_child(0));
+        let Some(lhs) = left else { continue };
+        if lhs.kind() == "variable_declaration" {
+            for li in 0..lhs.named_child_count() {
+                if let Some(var_node) = lhs.named_child(li) {
+                    if is_perl_var_type(var_node.kind()) {
+                        left = Some(var_node);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(lhs) = left {
+            let name = crate::fqn::node_text(lhs, ctx.source);
+            let stripped = name.strip_prefix(['$', '@', '%']).unwrap_or(name);
+            push_var_def(ctx, stripped, node);
+        }
+        return;
+    }
+}
+
+/// R assignment LHS with function-def skip (C extract_r_vars).
+fn extract_r_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    for ri in 0..node.named_child_count() {
+        if let Some(ch) = node.named_child(ri) {
+            if ch.kind() == "function_definition" {
+                return;
+            }
+        }
+    }
+    let left = node
+        .child_by_field_name("left")
+        .or_else(|| node.child_by_field_name("lhs"))
+        .or_else(|| node.named_child(0));
+    if let Some(left) = left {
+        if matches!(left.kind(), "identifier" | "constant" | "string") {
+            let name = crate::fqn::node_text(left, ctx.source);
+            push_var_def(ctx, name, node);
+        }
+    }
+}
+
+/// Kotlin name resolution (C resolve_kotlin_var_name).
+fn resolve_kotlin_var_name<'t>(node: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+    if let Some(n) = node.child_by_field_name("name") {
+        return Some(n);
+    }
+    if let Some(n) = crate::fqn::find_child_by_kind(node, "simple_identifier") {
+        return Some(n);
+    }
+    if let Some(n) = crate::fqn::find_child_by_kind(node, "identifier") {
+        return Some(n);
+    }
+    let var_decl = crate::fqn::find_child_by_kind(node, "variable_declaration")?;
+    crate::fqn::find_child_by_kind(var_decl, "simple_identifier")
+        .or_else(|| crate::fqn::find_child_by_kind(var_decl, "identifier"))
+}
+
+/// JVM variables: Scala pattern/name, Kotlin chain, Groovy name/declarator.
+fn extract_vars_jvm(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    match ctx.language {
+        Language::SCALA => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                let name = crate::fqn::node_text(pattern, ctx.source);
+                push_var_def(ctx, name, node);
+            } else if let Some(name_node) = node.child_by_field_name("name") {
+                let name = crate::fqn::node_text(name_node, ctx.source);
+                push_var_def(ctx, name, node);
+            }
+        }
+        Language::KOTLIN => {
+            if let Some(name_node) = resolve_kotlin_var_name(node) {
+                let name = crate::fqn::node_text(name_node, ctx.source);
+                push_var_def(ctx, name, node);
+            }
+        }
+        Language::GROOVY => {
+            let name_node = match node.child_by_field_name("name") {
+                Some(n) => Some(n),
+                None => {
+                    if let Some(cname) = extract_c_declarator_name(node, ctx.source) {
+                        push_var_def(ctx, &cname, node);
+                        return;
+                    }
+                    crate::fqn::find_child_by_kind(node, "identifier")
+                }
+            };
+            if let Some(n) = name_node {
+                let name = crate::fqn::node_text(n, ctx.source);
+                push_var_def(ctx, name, node);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn trim_whitespace(name: &str) -> &str {
+    name.trim_matches([' ', '\t'])
+}
+
+/// INI settings (C extract_ini_vars): setting_name/name child, else first
+/// child.
+fn extract_ini_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    let nc = node.child_count();
+    for i in 0..nc {
+        if let Some(child) = node.child(i) {
+            if matches!(child.kind(), "setting_name" | "name") {
+                let name = trim_whitespace(crate::fqn::node_text(child, ctx.source));
+                push_var_def(ctx, name, node);
+                return;
+            }
+        }
+    }
+    if nc > 0 {
+        let has_name = (0..nc).any(|i| {
+            node.child(i)
+                .map(|c| matches!(c.kind(), "setting_name" | "name"))
+                .unwrap_or(false)
+        });
+        if !has_name {
+            if let Some(first) = node.child(0) {
+                let name = trim_whitespace(crate::fqn::node_text(first, ctx.source));
+                push_var_def(ctx, name, node);
+            }
+        }
+    }
+}
+
+/// First named child matching one of the types (C push_first_matching_child).
+fn push_first_matching_child(
+    ctx: &mut ExtractCtx<'_>,
+    node: tree_sitter::Node<'_>,
+    match_types: &[&str],
+) {
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else {
+            continue;
+        };
+        if match_types.contains(&child.kind()) {
+            let name = crate::fqn::node_text(child, ctx.source);
+            push_var_def(ctx, name, node);
+            return;
+        }
+    }
+}
+
+/// JSON key with quote strip (C extract_json_var).
+fn extract_json_var(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    let Some(key_node) = node.child_by_field_name("key") else {
+        return;
+    };
+    let raw = crate::fqn::node_text(key_node, ctx.source);
+    let b = raw.as_bytes();
+    let stripped = if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    push_var_def(ctx, stripped, node);
+}
+
+/// SCSS variable name (C extract_scss_var): property > name >
+/// property_name > variable_name.
+fn extract_scss_var(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    let prop = node
+        .child_by_field_name("property")
+        .or_else(|| node.child_by_field_name("name"))
+        .or_else(|| crate::fqn::find_child_by_kind(node, "property_name"))
+        .or_else(|| crate::fqn::find_child_by_kind(node, "variable_name"));
+    if let Some(prop) = prop {
+        let name = crate::fqn::node_text(prop, ctx.source);
+        push_var_def(ctx, name, node);
+    }
+}
+
+/// TOML bare/dotted/quoted key (C find_toml_key_name).
+fn find_toml_key_name<'t>(node: tree_sitter::Node<'t>, source: &'t str) -> Option<String> {
+    for i in 0..node.child_count() {
+        let child = node.child(i)?;
+        if matches!(
+            child.kind(),
+            "bare_key" | "dotted_key" | "quoted_key" | "key"
+        ) {
+            return Some(crate::fqn::node_text(child, source).to_string());
+        }
+    }
+    None
+}
+
+/// Config-language variables (C extract_vars_config).
+fn extract_vars_config(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    let kind = node.kind();
+    match ctx.language {
+        Language::YAML => {
+            if let Some(key) = node.child_by_field_name("key") {
+                let name = crate::fqn::node_text(key, ctx.source);
+                push_var_def(ctx, name, node);
+            }
+        }
+        Language::TOML => {
+            if let Some(name) = find_toml_key_name(node, ctx.source) {
+                push_var_def(ctx, &name, node);
+            }
+        }
+        Language::JSON => extract_json_var(ctx, node),
+        Language::INI => extract_ini_vars(ctx, node),
+        Language::ERLANG => {
+            if matches!(kind, "pp_define" | "record_decl") {
+                push_first_matching_child(ctx, node, &["atom", "var", "macro_lhs"]);
+            }
+        }
+        Language::SQL => {
+            push_first_matching_child(ctx, node, &["identifier", "object_reference"]);
+        }
+        Language::BASH => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = crate::fqn::node_text(name_node, ctx.source);
+                push_var_def(ctx, name, node);
+            } else {
+                push_first_matching_child(ctx, node, &["variable_name", "word"]);
+            }
+        }
+        Language::SCSS => extract_scss_var(ctx, node),
+        _ => {}
+    }
+}
+
+/// Nix module-level binding (C extract_vars_nix): skip lambda-valued
+/// bindings (already Functions) and attrset scopes; the name is the
+/// attrpath leaf and the QN carries the whole path.
+fn extract_vars_nix(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    if node.kind() != "binding" {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("expression") else {
+        return;
+    };
+    if value.kind() == "function_expression" {
+        return; // already a Function
+    }
+    if nix_binding_is_attrset_scope(node) {
+        return; // a scope, not a value
+    }
+    let attrpath = node.child_by_field_name("attrpath");
+    let Some(leaf) = attrpath.and_then(nix_attrpath_last_attr) else {
+        return;
+    };
+    if nix_attr_is_interpolated(leaf) {
+        return;
+    }
+    let name_raw = crate::fqn::node_text(leaf, ctx.source);
+    if name_raw.is_empty() {
+        return;
+    }
+    let name = nix_strip_attr_quotes(name_raw);
+    let scope = attrpath.and_then(|ap| nix_attrpath_scope(ap, ctx.source));
+    let qn_name = scope.as_ref().map(|s| format!("{s}.{name}"));
+    push_var_def_qn(ctx, name, qn_name.as_deref(), node);
+}
+
+/// Dockerfile ENV/ARG (C inline in extract_var_names).
+fn extract_dockerfile_vars(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    let kind = node.kind();
+    if kind == "env_instruction" {
+        for i in 0..node.named_child_count() {
+            let Some(pair) = node.named_child(i) else {
+                continue;
+            };
+            if pair.kind() != "env_pair" {
+                continue;
+            }
+            if let Some(nm) = pair.child_by_field_name("name") {
+                let name = crate::fqn::node_text(nm, ctx.source);
+                push_var_def(ctx, name, pair);
+            }
+        }
+    } else if kind == "arg_instruction" {
+        let nm = node
+            .child_by_field_name("name")
+            .or_else(|| crate::fqn::find_child_by_kind(node, "unquoted_string"));
+        if let Some(nm) = nm {
+            let name = crate::fqn::node_text(nm, ctx.source);
+            push_var_def(ctx, name, node);
+        }
+    }
+}
+
+/// Mainstream group (C extract_vars_mainstream).
+fn extract_vars_mainstream(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    match ctx.language {
+        Language::PYTHON => extract_python_vars(ctx, node),
+        Language::GO => extract_go_vars(ctx, node),
+        Language::JAVASCRIPT | Language::TYPESCRIPT | Language::TSX | Language::ARKTS => {
+            extract_js_vars(ctx, node)
+        }
+        Language::JAVA => {
+            if let Some(fname) = extract_java_field_name(node, ctx.source) {
+                push_var_def(ctx, &fname, node);
+            }
+        }
+        Language::CSHARP => extract_csharp_vars(ctx, node),
+        Language::CPP | Language::C | Language::OBJC => {
+            if let Some(vname) = extract_c_declarator_name(node, ctx.source) {
+                push_var_def(ctx, &vname, node);
+            }
+        }
+        Language::RUST => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = crate::fqn::node_text(name_node, ctx.source);
+                push_var_def(ctx, name, node);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Dynamic/scripting group (C extract_vars_dynamic).
+fn extract_vars_dynamic(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    match ctx.language {
+        Language::PHP => extract_php_vars(ctx, node),
+        Language::LUA => extract_lua_vars(ctx, node),
+        Language::RUBY => {
+            if let Some(left) = node.child_by_field_name("left") {
+                if matches!(left.kind(), "identifier" | "constant") {
+                    let name = crate::fqn::node_text(left, ctx.source);
+                    push_var_def(ctx, name, node);
+                }
+            }
+        }
+        Language::R => extract_r_vars(ctx, node),
+        Language::PERL => extract_perl_vars(ctx, node),
+        _ => {}
+    }
+}
+
+/// Variable-name dispatch (C extract_var_names): Nix first, then the
+/// language groups, Dockerfile/.properties/go.mod special shapes, and the
+/// name-field → C-declarator → first-identifier fallback.
+pub fn extract_var_names(ctx: &mut ExtractCtx<'_>, node: tree_sitter::Node<'_>) {
+    if ctx.language == Language::NIX {
+        extract_vars_nix(ctx, node);
+        return;
+    }
+    match ctx.language {
+        Language::PYTHON
+        | Language::GO
+        | Language::JAVASCRIPT
+        | Language::TYPESCRIPT
+        | Language::TSX
+        | Language::ARKTS
+        | Language::JAVA
+        | Language::CSHARP
+        | Language::CPP
+        | Language::C
+        | Language::OBJC
+        | Language::RUST => {
+            extract_vars_mainstream(ctx, node);
+            return;
+        }
+        Language::PHP | Language::LUA | Language::RUBY | Language::R | Language::PERL => {
+            extract_vars_dynamic(ctx, node);
+            return;
+        }
+        Language::SCALA | Language::KOTLIN | Language::GROOVY => {
+            extract_vars_jvm(ctx, node);
+            return;
+        }
+        Language::YAML
+        | Language::TOML
+        | Language::JSON
+        | Language::INI
+        | Language::ERLANG
+        | Language::SQL
+        | Language::BASH
+        | Language::SCSS => {
+            extract_vars_config(ctx, node);
+            return;
+        }
+        Language::DOCKERFILE => {
+            extract_dockerfile_vars(ctx, node);
+            return;
+        }
+        Language::PROPERTIES => {
+            if node.kind() == "property" {
+                if let Some(key) = crate::fqn::find_child_by_kind(node, "key") {
+                    let name = crate::fqn::node_text(key, ctx.source);
+                    push_var_def(ctx, name, node);
+                }
+            }
+            return;
+        }
+        Language::GOMOD => {
+            if matches!(node.kind(), "require_directive" | "replace_directive") {
+                for i in 0..node.named_child_count() {
+                    let Some(req_spec) = node.named_child(i) else {
+                        continue;
+                    };
+                    if !matches!(req_spec.kind(), "require_spec" | "replace_spec") {
+                        continue;
+                    }
+                    if let Some(mp) = crate::fqn::find_child_by_kind(req_spec, "module_path") {
+                        let name = crate::fqn::node_text(mp, ctx.source);
+                        push_var_def(ctx, name, req_spec);
+                    }
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Default fallback: name field → C-declarator → first identifier.
+    if let Some(name_node) = node.child_by_field_name("name") {
+        let name = crate::fqn::node_text(name_node, ctx.source);
+        push_var_def(ctx, name, node);
+        return;
+    }
+    if let Some(cname) = extract_c_declarator_name(node, ctx.source) {
+        push_var_def(ctx, &cname, node);
+        return;
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            if child.kind() == "identifier" {
+                let name = crate::fqn::node_text(child, ctx.source);
+                push_var_def(ctx, name, node);
+                return;
+            }
+        }
+    }
+}
+
+/// Iterative variable walker for nested config structures (C
+/// walk_variables_iter): descend only through the config-container kinds.
+pub fn walk_variables_iter(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
+    let mut stack = vec![ctx.root];
+    while let Some(node) = stack.pop() {
+        for i in (0..node.child_count()).rev() {
+            let Some(child) = node.child(i) else { continue };
+            if spec.variable_node_types.contains(&child.kind())
+                && is_module_level_p(node, ctx.language)
+            {
+                extract_var_names(ctx, child);
+            }
+            if matches!(
+                child.kind(),
+                "document"
+                    | "block_node"
+                    | "block_mapping"
+                    | "stream"
+                    | "table"
+                    | "table_array_element"
+                    | "section"
+                    | "object"
+                    | "array"
+                    | "pair"
+                    | "element"
+                    | "content"
+            ) {
+                stack.push(child);
+            }
+        }
+    }
+}
+
+/// Nix module variables (C extract_nix_module_vars): walk past the header
+/// lambda(s) to the let body / returned attrset and mint each direct
+/// binding. Deeper nesting is deliberately skipped.
+const NIX_HEADER_HOP_MAX: usize = 8;
+
+fn extract_nix_binding_set(ctx: &mut ExtractCtx<'_>, set: Option<tree_sitter::Node<'_>>) {
+    let Some(set) = set else { return };
+    for i in 0..set.named_child_count() {
+        if let Some(child) = set.named_child(i) {
+            if child.kind() == "binding" {
+                extract_var_names(ctx, child);
+            }
+        }
+    }
+}
+
+pub fn extract_nix_module_vars(ctx: &mut ExtractCtx<'_>) {
+    let mut cur = if ctx.root.named_child_count() > 0 {
+        ctx.root.named_child(0)
+    } else {
+        Some(ctx.root)
+    };
+    // Descend header lambdas: `{ pkgs, ... }: <body>`, `final: prev: <body>`.
+    for _ in 0..NIX_HEADER_HOP_MAX {
+        let Some(c) = cur else { return };
+        if c.kind() != "function_expression" {
+            break;
+        }
+        cur = c.child_by_field_name("body");
+    }
+    let Some(cur) = cur else { return };
+    if cur.kind() == "let_expression" {
+        extract_nix_binding_set(ctx, crate::fqn::find_child_by_kind(cur, "binding_set"));
+        let Some(body) = cur.child_by_field_name("body") else {
+            return;
+        };
+        let k = body.kind();
+        if matches!(k, "attrset_expression" | "rec_attrset_expression") {
+            extract_nix_binding_set(ctx, crate::fqn::find_child_by_kind(body, "binding_set"));
+        } else if k == "binding_set" {
+            extract_nix_binding_set(ctx, Some(body));
+        }
+        return;
+    }
+    let k = cur.kind();
+    if matches!(k, "attrset_expression" | "rec_attrset_expression") {
+        extract_nix_binding_set(ctx, crate::fqn::find_child_by_kind(cur, "binding_set"));
+    } else if k == "binding_set" {
+        // crates.io grammar: a top-level `{ ... }` IS the binding_set
+        // (the C's vendored grammar wrapped it in attrset_expression).
+        extract_nix_binding_set(ctx, Some(cur));
+    }
+}
+
+/// True when the basename is values.yaml / values.yml (Helm values, #338).
+pub fn is_helm_values_file(rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base == "values.yaml" || base == "values.yml"
+}
+
+/// Find the YAML top-level block_mapping (C find_yaml_toplevel_mapping):
+/// descend through document/block_node wrappers, at most 6 levels.
+fn find_yaml_toplevel_mapping(root: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut cur = root;
+    for _ in 0..6 {
+        let mut next = None;
+        for i in 0..cur.child_count() {
+            let ch = cur.child(i)?;
+            match ch.kind() {
+                "block_mapping" => return Some(ch),
+                "document" | "block_node" if next.is_none() => next = Some(ch),
+                _ => {}
+            }
+        }
+        cur = next?;
+    }
+    None
+}
+
+/// Helm values.yaml: only top-level keys, not the per-leaf flood (C
+/// extract_yaml_toplevel_keys).
+fn extract_yaml_toplevel_keys(ctx: &mut ExtractCtx<'_>) {
+    let Some(bm) = find_yaml_toplevel_mapping(ctx.root) else {
+        return;
+    };
+    for i in 0..bm.named_child_count() {
+        let Some(pair) = bm.named_child(i) else {
+            continue;
+        };
+        if pair.kind() != "block_mapping_pair" {
+            continue;
+        }
+        if let Some(key) = pair.child_by_field_name("key") {
+            let name = crate::fqn::node_text(key, ctx.source);
+            push_var_def(ctx, name, pair);
+        }
+    }
+}
+
+/// Module-level variable extraction (C extract_variables): Helm values
+/// special case, nested-config walker, Nix header resolution, then the
+/// top-level loop with wrapper unwrapping.
+pub fn extract_variables(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
+    if spec.variable_node_types.is_empty() {
+        return;
+    }
+
+    // Helm values.yaml: only top-level keys, not the per-leaf flood.
+    if ctx.language == Language::YAML && is_helm_values_file(ctx.rel_path) {
+        extract_yaml_toplevel_keys(ctx);
+        return;
+    }
+
+    // Config languages with nested structure: recursive walk.
+    if matches!(
+        ctx.language,
+        Language::YAML | Language::TOML | Language::INI | Language::JSON
+    ) {
+        walk_variables_iter(ctx, spec);
+        return;
+    }
+
+    // Nix: the file's top level sits behind its header lambda(s); resolve
+    // to the binding container(s) that constitute file scope, and mint
+    // only THEIR direct bindings.
+    if ctx.language == Language::NIX {
+        extract_nix_module_vars(ctx);
+        return;
+    }
+
+    // root is the file root, so the module-level check is invariant across
+    // the loop — hoist it out (C comment).
+    if !is_module_level_p(ctx.root, ctx.language) {
+        return;
+    }
+
+    // Top-level children with wrapper unwrapping (expression_statement /
+    // export_statement / statement).
+    for i in 0..ctx.root.child_count() {
+        let Some(child) = ctx.root.child(i) else {
+            continue;
+        };
+        if spec.variable_node_types.contains(&child.kind()) {
+            extract_var_names(ctx, child);
+            continue;
+        }
+        let ck = child.kind();
+        if matches!(
+            ck,
+            "expression_statement" | "export_statement" | "statement"
+        ) {
+            for j in 0..child.named_child_count() {
+                if let Some(inner) = child.named_child(j) {
+                    if spec.variable_node_types.contains(&inner.kind()) {
+                        extract_var_names(ctx, inner);
+                    }
+                }
+            }
+            // The wrapper itself may be a variable type (PHP
+            // expression_statement).
+            if spec.variable_node_types.contains(&ck) {
+                extract_var_names(ctx, child);
+            }
+        }
+    }
+}
+
+// ── walk_defs (C, main-language dispatch) ───────────────────────
 // ── walk_defs (C, main-language dispatch) ───────────────────────
 
 /// Walk the AST extracting function/class/variable definitions
@@ -1660,5 +2760,249 @@ def process(items):
         let defs = run(Language::PYTHON, src, "a.py");
         let f = defs.iter().find(|d| d.name == "process").expect("def");
         assert_eq!(f.fingerprint.len(), minhash::MINHASH_K);
+    }
+
+    // ── Variable extraction layer ──
+
+    #[test]
+    fn module_level_tables() {
+        // Direct-root languages.
+        let tree = crate::ts::parse(Language::GO, "var x = 1\n").unwrap();
+        assert!(is_module_level_p(tree.root_node(), Language::GO));
+        // Python wrapper: assignment → expression_statement → module.
+        let tree2 = crate::ts::parse(Language::PYTHON, "x = 1\n").unwrap();
+        let prog = tree2.root_node();
+        let stmt = prog.named_child(0).unwrap();
+        assert!(is_module_level_p(prog, Language::PYTHON), "direct module");
+        assert!(
+            is_module_level_p(stmt, Language::PYTHON),
+            "expression_statement wrapper"
+        );
+        // Non-parent kinds fail.
+        assert!(!is_module_level_p(stmt, Language::GO));
+    }
+
+    #[test]
+    fn python_vars_tuple_unpack() {
+        let src = "x = 1\ny, z = f()\nw = 2\n";
+        let defs = run(Language::PYTHON, src, "a.py");
+        let names: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        for n in ["x", "y", "z", "w"] {
+            assert!(names.contains(&n), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn go_var_specs() {
+        let src = "package main\n\nvar (\n\ta = 1\n\tb = 2\n)\nconst c = 3\n";
+        let defs = run(Language::GO, src, "db/conn.go");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        for n in ["a", "b", "c"] {
+            assert!(vars.contains(&n), "{vars:?}");
+        }
+        // Java/Go directory-based module: var QN carries the dir path but
+        // NOT the filename (proj.myapp.db.Var per the C comment).
+        let a = defs.iter().find(|d| d.name == "a").unwrap();
+        assert!(
+            a.qualified_name.starts_with("proj.db."),
+            "{:?}",
+            a.qualified_name
+        );
+    }
+
+    #[test]
+    fn js_destructuring() {
+        let src = "const { p, q } = obj;\nlet [r, s] = arr;\n";
+        let defs = run(Language::JAVASCRIPT, src, "a.js");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        for n in ["p", "q", "r", "s"] {
+            assert!(vars.contains(&n), "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn c_declarator_chain() {
+        // No C grammar crate compiled in; the declarator-chain logic is
+        // covered by extract_c_declarator_name's unit test below.
+        let src = "int main(void) { return 0; }\nstatic char *buf = 0;\n";
+        if crate::ts::parse(Language::C, src).is_none() {
+            return;
+        }
+        let defs = run(Language::C, src, "a.c");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(vars.contains(&"buf"), "{vars:?}");
+    }
+
+    #[test]
+    fn helm_values_top_level_only() {
+        let src = "replicas: 2\nimage:\n  tag: latest\n  repo: x\n";
+        let defs = run(Language::YAML, src, "chart/values.yaml");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        // Top-level keys only: `replicas` and `image`, NOT tag/repo.
+        assert!(vars.contains(&"replicas"), "{vars:?}");
+        assert!(vars.contains(&"image"), "{vars:?}");
+        assert!(!vars.contains(&"tag"), "nested key flooded: {vars:?}");
+        assert!(!vars.contains(&"repo"));
+    }
+
+    #[test]
+    fn yaml_walk_uses_container_list() {
+        let src = "service:\n  port: 8080\n";
+        let defs = run(Language::YAML, src, "conf.yaml");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        // The C's container list has `pair` but not `block_mapping_pair`, so
+        // nested mapping pairs are unreachable — only top-level keys bind.
+        // 1:1 with that behavior.
+        assert!(vars.contains(&"service"), "{vars:?}");
+        assert!(
+            !vars.contains(&"port"),
+            "nested pair unreachable via C container list: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn toml_and_json_vars() {
+        let src = "[table]\nkey = 1\n";
+        let Some(tree) = crate::ts::parse(Language::TOML, src) else {
+            // TOML grammar crate not compiled in — extraction yields nothing
+            // (same as any language without a grammar).
+            return;
+        };
+        let mut ctx = ExtractCtx::new(src, tree.root_node(), Language::TOML, "proj", "a.toml");
+        let spec = crate::lang_specs::lang_spec(Language::TOML);
+        extract_definitions(&mut ctx, spec);
+        let vars: Vec<&str> = ctx
+            .result
+            .definitions
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(vars.contains(&"table") || vars.contains(&"key"), "{vars:?}");
+    }
+
+    #[test]
+    fn nix_module_vars_behind_header_lambda() {
+        let src = "{ pkgs }: {\n  enable = true;\n  \"quoted-key\" = 2;\n  settings.attr = 3;\n}\n";
+        if crate::ts::parse(Language::NIX, src).is_none() {
+            return;
+        }
+        let defs = run(Language::NIX, src, "mod.nix");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(vars.contains(&"enable"), "{vars:?}");
+        assert!(vars.contains(&"quoted-key"), "{vars:?}");
+        assert!(vars.contains(&"attr"), "{vars:?}");
+        // Dotted attrpath: name is the leaf, QN carries the path.
+        let attr = defs.iter().find(|d| d.name == "attr").unwrap();
+        assert!(
+            attr.qualified_name.ends_with(".settings.attr"),
+            "{:?}",
+            attr.qualified_name
+        );
+    }
+
+    #[test]
+    fn nix_attrset_scope_not_var() {
+        let src = "{\n  nested = {\n    inner = 1;\n  };\n}\n";
+        if crate::ts::parse(Language::NIX, src).is_none() {
+            // No nix grammar? (It IS wired in; guard for config drift.)
+            return;
+        }
+        let defs = run(Language::NIX, src, "mod2.nix");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        // C rule: `nested` names a scope (attrset value) so the variable
+        // pass skips it, and `inner` is BEYOND file scope — the C mints only
+        // the container's DIRECT bindings and deliberately skips deeper
+        // ones. Net effect: no Variable from this shape.
+        assert!(vars.is_empty(), "{vars:?}");
+    }
+
+    #[test]
+    fn dockerfile_env_arg_vars() {
+        let src = "FROM alpine\nENV A=1 B=2\nARG C=3\n";
+        if crate::ts::parse(Language::DOCKERFILE, src).is_none() {
+            return; // grammar crate not compiled in
+        }
+        let defs = run(Language::DOCKERFILE, src, "Dockerfile");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        for n in ["A", "B", "C"] {
+            assert!(vars.contains(&n), "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn php_dollar_strip_and_ruby_left() {
+        let src = "<?php\n$name = \"x\";\n";
+        if crate::ts::parse(Language::PHP, src).is_none() {
+            return; // grammar crate not compiled in
+        }
+        let defs = run(Language::PHP, src, "a.php");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(vars.contains(&"name"), "sigil stripped: {vars:?}");
+
+        let src2 = "val = 1\nCONST = 2\n";
+        let defs2 = run(Language::RUBY, src2, "a.rb");
+        let vars2: Vec<&str> = defs2
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(vars2.contains(&"val"), "{vars2:?}");
+        assert!(vars2.contains(&"CONST"), "{vars2:?}");
+    }
+
+    #[test]
+    fn gomod_require_directives() {
+        let src = "module example.com/m\n\ngo 1.21\n\nrequire (\n\tgithub.com/x/y v1.0.0\n)\n";
+        if crate::ts::parse(Language::GOMOD, src).is_none() {
+            return; // grammar crate not compiled in
+        }
+        let defs = run(Language::GOMOD, src, "go.mod");
+        let vars: Vec<&str> = defs
+            .iter()
+            .filter(|d| d.label == "Variable")
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(vars.contains(&"github.com/x/y"), "{vars:?}");
     }
 }
