@@ -538,13 +538,20 @@ pub fn extract_unified(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
             // Descend.
             if !trivia || node.child_count() > 0 {
                 if let Some(first) = node.child(0) {
+                    // Advance the parent's cursor BEFORE pushing, or the
+                    // next iteration re-enters this node with next_child
+                    // still 0 and pushes the first child forever.
+                    stack.last_mut().unwrap().2 = 1;
                     stack.push((first, depth + 1, 0));
                     continue;
                 }
             }
-            // No children → fall through to sibling logic via one more loop
-            // iteration with next_child at count.
-            stack.last_mut().unwrap().2 = node.child_count();
+            // No children → exit directly. Setting next_child = count ==
+            // 0 would re-enter this leaf forever (next_child == 0 means
+            // Entering); a non-trivia leaf like the Go `package` keyword
+            // token is exactly that shape.
+            state.pop_expired_scopes(depth);
+            stack.pop();
             continue;
         }
         let count = node.child_count();
