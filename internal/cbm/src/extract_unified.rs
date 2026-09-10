@@ -654,6 +654,10 @@ fn is_unified_trivia_node(node: tree_sitter::Node<'_>) -> bool {
 /// NOT also run standalone afterwards, or records duplicate.
 pub fn extract_unified(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
     let mut state = WalkState::new(&ctx.module_qn);
+    let mut tracker = crate::extract_usages::LexicalBindingTracker {
+        usage_start_index: ctx.result.usages.len(),
+        ..Default::default()
+    };
     let mut stack: Vec<(tree_sitter::Node<'_>, u32, usize)> = vec![(ctx.root, 0, 0)]; // (node, depth, next_child)
 
     while let Some((node, depth, next_child)) = stack.last().copied() {
@@ -691,25 +695,41 @@ pub fn extract_unified(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
                 // Unified usages: binding→skip, write→skip, label→skip,
                 // else usage attributed to the STATE's function QN (O(1),
                 // no ef_cache parent-chain walk).
+                // Binding occurrences are recorded into the lexical table
+                // (C handle_usages → record_lexical_binding) so the walk
+                // finalizer can block shadowed short-name resolution.
                 if crate::extract_usages::is_reference_node(node, ctx.language)
                     && !crate::extract_usages::is_call_argument_label(node)
-                    && !state.inside_import
-                    && state.call_depth == 0
-                    && !unified_is_binding(node, spec)
-                    && !unified_is_write(node, spec)
                 {
-                    let name = crate::fqn::node_text(node, ctx.source);
-                    if !name.is_empty() && !helpers::is_keyword(name, ctx.language) {
-                        ctx.result.usages.push(Usage {
-                            ref_name: name.to_string(),
-                            enclosing_func_qn: state.enclosing_func_qn.clone(),
-                            kind: UsageKind::Value,
-                            lexical_scope_id: 0,
-                            site_start_byte: node.start_byte() as u32,
-                            site_end_byte: node.end_byte() as u32,
-                            source_origin: SourceOrigin::Raw,
-                            ..Default::default()
-                        });
+                    let inside_import = state.inside_import;
+                    let in_call = state.call_depth > 0;
+                    if unified_is_binding(node, spec) || unified_is_write(node, spec) {
+                        let bname = crate::fqn::node_text(node, ctx.source);
+                        if !bname.is_empty() && !helpers::is_keyword(bname, ctx.language) {
+                            crate::extract_usages::record_lexical_binding(
+                                &mut tracker,
+                                &mut state,
+                                node,
+                                spec,
+                                bname,
+                                inside_import,
+                                ctx.language,
+                            );
+                        }
+                    } else if !inside_import && !in_call {
+                        let name = crate::fqn::node_text(node, ctx.source);
+                        if !name.is_empty() && !helpers::is_keyword(name, ctx.language) {
+                            ctx.result.usages.push(Usage {
+                                ref_name: name.to_string(),
+                                enclosing_func_qn: state.enclosing_func_qn.clone(),
+                                kind: UsageKind::Value,
+                                lexical_scope_id: state.current_lexical_scope_id(),
+                                site_start_byte: node.start_byte() as u32,
+                                site_end_byte: node.end_byte() as u32,
+                                source_origin: SourceOrigin::Raw,
+                                ..Default::default()
+                            });
+                        }
                     }
                 }
                 // Record-type extractors (state-attributed via the shared
@@ -788,6 +808,12 @@ pub fn extract_unified(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
             stack.pop();
         }
     }
+
+    // Finalize lexical usages: sort bindings, then block every shadowed
+    // short-name resolution (C cbm_finalize_lexical_usages).
+    let mut usages = std::mem::take(&mut ctx.result.usages);
+    crate::extract_usages::finalize_lexical_usages(&tracker, &state, &mut usages, ctx.language);
+    ctx.result.usages = usages;
 }
 
 #[cfg(test)]
