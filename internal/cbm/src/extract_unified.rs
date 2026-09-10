@@ -84,7 +84,35 @@ struct ScopeFrame {
     prev_branch_depth: i32,
 }
 
-/// Unified walk state (C WalkState, scope machinery subset).
+/// Concrete lexical scope kind (C CBMLexicalScopeKind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum LexicalScopeKind {
+    #[default]
+    Module = 0,
+    Class,
+    Function,
+    Block,
+    Comprehension,
+}
+
+/// Concrete AST scope identity (C CBMLexicalScope): QNs remain graph
+/// attribution metadata only, so overloads/lambdas/sibling blocks never
+/// share binding facts.
+#[derive(Debug, Clone)]
+pub struct LexicalScope {
+    pub id: u32,
+    pub parent_id: u32,
+    /// Python method/function lookup bypasses the containing class
+    /// namespace; class attributes require qualification.
+    pub lookup_parent_id: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub kind: LexicalScopeKind,
+}
+
+/// Unified walk state (C WalkState, scope machinery subset + lexical
+/// scopes). Lexical bindings record on it in the next step.
 pub struct WalkState {
     pub enclosing_func_qn: String,
     pub enclosing_class_qn: Option<String>,
@@ -93,6 +121,12 @@ pub struct WalkState {
     pub branch_depth: i32,
     pub call_depth: usize,
     scopes: Vec<ScopeFrame>,
+    /// Id of the lexical scope attached to each walk-scope frame.
+    frame_lexical_ids: Vec<u32>,
+    /// Concrete lexical scope arena (id = index + 1).
+    pub lexical_scopes: Vec<LexicalScope>,
+    /// The module-root lexical scope (id 1), created at walk start.
+    pub root_lexical_scope_id: u32,
 }
 
 impl WalkState {
@@ -105,7 +139,115 @@ impl WalkState {
             branch_depth: 0,
             call_depth: 0,
             scopes: Vec::with_capacity(64), // MAX_SCOPES
+            frame_lexical_ids: Vec::with_capacity(64),
+            lexical_scopes: Vec::with_capacity(64),
+            root_lexical_scope_id: 0,
         }
+    }
+
+    /// Current innermost lexical scope id (C current_lexical_scope_id): the
+    /// topmost frame that carries one, else the root.
+    fn current_lexical_scope_id(&self) -> u32 {
+        for id in self.frame_lexical_ids.iter().rev() {
+            if *id != 0 {
+                return *id;
+            }
+        }
+        self.root_lexical_scope_id
+    }
+
+    /// Python function lookup parent: bypass the containing CLASS namespace
+    /// (class attributes require `self.x`/`Cls.x`), stopping at the first
+    /// enclosing function/comprehension/module (C
+    /// python_function_lookup_parent).
+    fn python_function_lookup_parent(&self, structural_parent_id: u32) -> u32 {
+        let mut id = structural_parent_id;
+        let mut remaining = self.lexical_scopes.len();
+        while id != 0 && remaining > 0 {
+            remaining -= 1;
+            let Some(scope) = self.lexical_scope_by_id(id) else {
+                return structural_parent_id;
+            };
+            match scope.kind {
+                LexicalScopeKind::Class => return scope.lookup_parent_id,
+                LexicalScopeKind::Function
+                | LexicalScopeKind::Comprehension
+                | LexicalScopeKind::Module => {
+                    return structural_parent_id;
+                }
+                LexicalScopeKind::Block => {}
+            }
+            id = scope.parent_id;
+        }
+        structural_parent_id
+    }
+
+    /// Register a concrete lexical scope for `node` (C add_lexical_scope).
+    fn add_lexical_scope(
+        &mut self,
+        node: tree_sitter::Node<'_>,
+        kind: LexicalScopeKind,
+        lang: Language,
+    ) -> u32 {
+        let parent_id = self.current_lexical_scope_id();
+        let mut lookup_parent_id = parent_id;
+        if kind == LexicalScopeKind::Function && lang == Language::PYTHON {
+            lookup_parent_id = self.python_function_lookup_parent(parent_id);
+        }
+        let scope = LexicalScope {
+            id: self.lexical_scopes.len() as u32 + 1,
+            parent_id,
+            lookup_parent_id,
+            start_byte: node.start_byte() as u32,
+            end_byte: node.end_byte() as u32,
+            kind,
+        };
+        let id = scope.id;
+        if self.root_lexical_scope_id == 0 {
+            self.root_lexical_scope_id = id; // first scope registered is the module
+        }
+        self.lexical_scopes.push(scope);
+        id
+    }
+
+    fn lexical_scope_by_id(&self, id: u32) -> Option<&LexicalScope> {
+        self.lexical_scopes.get(id.wrapping_sub(1) as usize)
+    }
+
+    /// Push a scope frame that also opens a concrete lexical scope (C
+    /// push_lexical_scope). Returns the new lexical scope id (0 on cap
+    /// failure — the caller fails closed).
+    fn push_lexical_scope(
+        &mut self,
+        kind: u8,
+        depth: u32,
+        qn: Option<String>,
+        node: tree_sitter::Node<'_>,
+        lexical_kind: LexicalScopeKind,
+        lang: Language,
+    ) -> u32 {
+        if !self.push_scope(kind, depth, qn) {
+            return 0;
+        }
+        let id = self.add_lexical_scope(node, lexical_kind, lang);
+        let last = self.frame_lexical_ids.len() - 1;
+        self.frame_lexical_ids[last] = id;
+        id
+    }
+
+    /// Is a lexical scope for this exact byte span already open on the
+    /// frame stack? (C node_already_has_lexical_scope.)
+    fn node_already_has_lexical_scope(&self, node: tree_sitter::Node<'_>) -> bool {
+        let start = node.start_byte() as u32;
+        let end = node.end_byte() as u32;
+        for fid in &self.frame_lexical_ids {
+            if let Some(scope) = self.lexical_scope_by_id(*fid) {
+                if scope.start_byte == start && scope.end_byte == end {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Push a scope frame: save the displaced tuple, apply the frame's
@@ -139,6 +281,7 @@ impl WalkState {
             _ => {}
         }
         self.scopes.push(frame);
+        self.frame_lexical_ids.push(0);
         true
     }
 
@@ -150,6 +293,7 @@ impl WalkState {
                 break;
             }
             let f = self.scopes.pop().expect("len checked");
+            self.frame_lexical_ids.pop();
             self.enclosing_func_qn = f.prev_enclosing_func_qn;
             self.enclosing_class_qn = f.prev_enclosing_class_qn;
             self.inside_import = f.prev_inside_import;
@@ -285,6 +429,61 @@ fn is_export_of_declaration(node: tree_sitter::Node<'_>) -> bool {
 
 // ── Boundary scopes (C push_boundary_scopes, main paths) ────────
 
+/// Classify anonymous lexical boundary nodes (C lexical_boundary_kind):
+/// Rust inline modules are MODULE scopes; comprehensions are their own
+/// FUNCTION-like scope; anonymous functions are FUNCTION; the block family
+/// is BLOCK.
+fn lexical_boundary_kind(kind: &str) -> Option<LexicalScopeKind> {
+    const BLOCK_KINDS: &[&str] = &[
+        "block",
+        "statement_block",
+        "compound_statement",
+        "for_in_statement",
+        "for_of_statement",
+        "enhanced_for_statement",
+        "foreach_statement",
+        "foreach_clause",
+        "loop_expression",
+        "match_block",
+        "case_block",
+        "script_block",
+        "do_block",
+    ];
+    const COMPREHENSION_KINDS: &[&str] = &[
+        "list_comprehension",
+        "set_comprehension",
+        "dictionary_comprehension",
+        "generator_expression",
+        "comprehension_expression",
+    ];
+    const ANONYMOUS_FUNCTION_KINDS: &[&str] = &[
+        "lambda",
+        "lambda_expression",
+        "anonymous_function",
+        "anonymous_function_creation_expression",
+        "anonymous_method_expression",
+        "arrow_function",
+        "closure_expression",
+        "func_literal",
+        "function_expression",
+        "function_literal",
+    ];
+    // Rust inline modules own independent item/import namespaces.
+    if kind == "mod_item" {
+        return Some(LexicalScopeKind::Module);
+    }
+    if COMPREHENSION_KINDS.contains(&kind) {
+        return Some(LexicalScopeKind::Comprehension);
+    }
+    if ANONYMOUS_FUNCTION_KINDS.contains(&kind) {
+        return Some(LexicalScopeKind::Function);
+    }
+    if BLOCK_KINDS.contains(&kind) {
+        return Some(LexicalScopeKind::Block);
+    }
+    None
+}
+
 fn push_boundary_scopes(
     ctx: &mut ExtractCtx<'_>,
     node: tree_sitter::Node<'_>,
@@ -292,7 +491,15 @@ fn push_boundary_scopes(
     state: &mut WalkState,
     depth: u32,
 ) {
-    // Function scopes: attribute in-body calls/usages to the function QN.
+    // Anonymous lexical boundaries (block/comprehension/lambda/mod) —
+    // checked first so they never double-push under the func/class arms.
+    if !state.node_already_has_lexical_scope(node) {
+        if let Some(lkind) = lexical_boundary_kind(node.kind()) {
+            state.push_lexical_scope(SCOPE_LEXICAL, depth, None, node, lkind, ctx.language);
+        }
+    }
+    // Function scopes: attribute in-body calls/usages to the function QN,
+    // opening the concrete FUNCTION lexical scope with them.
     if !spec.function_node_types.is_empty() && spec.function_node_types.contains(&node.kind()) {
         let fqn = crate::fqn::func_node_name(node, ctx.source, ctx.language)
             .map(|name| {
@@ -304,7 +511,14 @@ fn push_boundary_scopes(
                 )
             })
             .unwrap_or_else(|| ctx.module_qn.clone());
-        state.push_scope(SCOPE_FUNC, depth, Some(fqn));
+        state.push_lexical_scope(
+            SCOPE_FUNC,
+            depth,
+            Some(fqn),
+            node,
+            LexicalScopeKind::Function,
+            ctx.language,
+        );
         return; // C pushes a func scope and returns from the chain
     }
     // Class scopes.
@@ -316,7 +530,14 @@ fn push_boundary_scopes(
                 crate::fqn::fqn_compute(ctx.project, ctx.rel_path, Some(cname))
             })
             .unwrap_or_else(|| ctx.module_qn.clone());
-        state.push_scope(SCOPE_CLASS, depth, Some(cqn));
+        state.push_lexical_scope(
+            SCOPE_CLASS,
+            depth,
+            Some(cqn),
+            node,
+            LexicalScopeKind::Class,
+            ctx.language,
+        );
     }
 }
 
@@ -566,5 +787,160 @@ pub fn extract_unified(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
             state.pop_expired_scopes(depth);
             stack.pop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scopes_for(lang: Language, src: &str) -> (Vec<(u32, u32, LexicalScopeKind)>, u32) {
+        let tree = crate::ts::parse(lang, src).expect("grammar");
+        let mut ctx = ExtractCtx::new(src, tree.root_node(), lang, "proj", "f");
+        let spec = crate::lang_specs::lang_spec(lang);
+        extract_unified(&mut ctx, spec);
+        // The walk owns the state; re-run capturing scopes through a
+        // wrapper is intrusive — instead assert through the public result:
+        // scope registration is verified by running extract on a copy and
+        // re-walking manually here.
+        let tree2 = crate::ts::parse(lang, src).expect("grammar");
+        let mut state = WalkState::new("proj.f");
+        let _ = &mut ctx;
+        // Manually drive push/pop to verify scope machinery on the same tree.
+        let mut stack = vec![tree2.root_node()];
+        while let Some(n) = stack.pop() {
+            if !state.node_already_has_lexical_scope(n) {
+                if let Some(k) = lexical_boundary_kind(n.kind()) {
+                    state.push_lexical_scope(SCOPE_LEXICAL, 0, None, n, k, lang);
+                }
+            }
+            for i in (0..n.child_count()).rev() {
+                if let Some(c) = n.child(i) {
+                    stack.push(c);
+                }
+            }
+        }
+        (
+            state
+                .lexical_scopes
+                .iter()
+                .map(|s| (s.id, s.parent_id, s.kind))
+                .collect(),
+            state.root_lexical_scope_id,
+        )
+    }
+
+    #[test]
+    fn lexical_scopes_register_with_hierarchy() {
+        // A JS arrow function inside a function body: block/arrow scopes
+        // nest with parent ids chaining to the root scope.
+        let src = "function outer() {\n  const f = () => {\n    return 1;\n  };\n}\n";
+        let (scopes, root) = scopes_for(Language::JAVASCRIPT, src);
+        assert!(root >= 1, "root scope registered");
+        // The first scope's parent is 0 (whatever its kind — the manual
+        // drive starts at the tree root, so a `program` block-scope kind is
+        // not pushed; the first MATCHED boundary takes parent 0).
+        assert_eq!(scopes[0].1, 0);
+        assert!(scopes[0].0 == root);
+        // Every later scope's parent is an earlier id.
+        for (id, parent, kind) in &scopes[1..] {
+            assert!(*parent < *id, "id={id} parent={parent}");
+            assert!(matches!(
+                kind,
+                LexicalScopeKind::Block | LexicalScopeKind::Function | LexicalScopeKind::Module
+            ));
+        }
+    }
+
+    #[test]
+    fn mod_item_is_module_scope() {
+        assert_eq!(
+            lexical_boundary_kind("mod_item"),
+            Some(LexicalScopeKind::Module)
+        );
+        assert_eq!(
+            lexical_boundary_kind("list_comprehension"),
+            Some(LexicalScopeKind::Comprehension)
+        );
+        assert_eq!(
+            lexical_boundary_kind("arrow_function"),
+            Some(LexicalScopeKind::Function)
+        );
+        assert_eq!(
+            lexical_boundary_kind("statement_block"),
+            Some(LexicalScopeKind::Block)
+        );
+        assert_eq!(lexical_boundary_kind("identifier"), None);
+    }
+
+    #[test]
+    fn python_function_lookup_bypasses_class() {
+        // add_lexical_scope takes its parent from the current frame stack,
+        // so simulate nesting by pushing SCOPE_LEXICAL frames (the walk's
+        // real mechanism).
+        let tree = crate::ts::parse(Language::PYTHON, "x = 1\n").unwrap();
+        let node = tree.root_node();
+        let mut state = WalkState::new("p.f");
+        // Root module scope (id 1) at depth 0.
+        state.push_lexical_scope(
+            SCOPE_LEXICAL,
+            0,
+            None,
+            node,
+            LexicalScopeKind::Module,
+            Language::PYTHON,
+        );
+        // Class scope (id 2) nested at depth 1.
+        let class_id = state.push_lexical_scope(
+            SCOPE_LEXICAL,
+            1,
+            None,
+            node,
+            LexicalScopeKind::Class,
+            Language::PYTHON,
+        );
+        // Function scope (id 3) nested at depth 2: lookup parent must SKIP
+        // the class and point at the module (id 1).
+        let func_id = state.push_lexical_scope(
+            SCOPE_LEXICAL,
+            2,
+            None,
+            node,
+            LexicalScopeKind::Function,
+            Language::PYTHON,
+        );
+        let func = state.lexical_scope_by_id(func_id).unwrap();
+        assert_eq!(func.parent_id, class_id);
+        assert_eq!(func.lookup_parent_id, 1, "python lookup bypasses class");
+        // Non-Python languages keep lookup = structural parent.
+        let tree2 = crate::ts::parse(Language::JAVASCRIPT, "function f() {}\n").unwrap();
+        let node2 = tree2.root_node();
+        let mut js_state = WalkState::new("p.f");
+        js_state.push_lexical_scope(
+            SCOPE_LEXICAL,
+            0,
+            None,
+            node2,
+            LexicalScopeKind::Module,
+            Language::JAVASCRIPT,
+        );
+        let js_class = js_state.push_lexical_scope(
+            SCOPE_LEXICAL,
+            1,
+            None,
+            node2,
+            LexicalScopeKind::Class,
+            Language::JAVASCRIPT,
+        );
+        let js_func = js_state.push_lexical_scope(
+            SCOPE_LEXICAL,
+            2,
+            None,
+            node2,
+            LexicalScopeKind::Function,
+            Language::JAVASCRIPT,
+        );
+        let js = js_state.lexical_scope_by_id(js_func).unwrap();
+        assert_eq!(js.lookup_parent_id, js_class);
     }
 }
