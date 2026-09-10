@@ -22,6 +22,10 @@ tree-sitter-clojure = { workspace = true }
 tree-sitter-hcl = { workspace = true }
 tree-sitter-matlab = { workspace = true }
 tree-sitter-scss = { workspace = true }
+tree-sitter-nix = { workspace = true }
+tree-sitter-make = { workspace = true }
+tree-sitter-puppet = { workspace = true }
+tree-sitter-julia = { workspace = true }
 xxhash-rust = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }

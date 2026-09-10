@@ -266,19 +266,43 @@ pub fn is_definition_container(lang: Language, node: tree_sitter::Node<'_>, sour
     false
 }
 
-/// Callee name for the part-1 languages (C extract_callee_name, main path).
+/// Callee name (C extract_callee_name, full language dispatch).
 pub fn extract_callee_name<'a>(
     node: tree_sitter::Node<'a>,
     source: &'a str,
     lang: Language,
 ) -> Option<String> {
-    if is_definition_container(lang, node, source) {
+    if call_node_is_definition_container(lang, node, source) {
         return None;
     }
+    if is_nested_verilog_call_wrapper(lang, node) {
+        return None;
+    }
+
+    // Lean 4: skip type-position applies.
+    if lang == Language::LEAN && node.kind() == "apply" && lean_is_in_type_position(node) {
+        return None;
+    }
+
+    // Pkl: resolve here and return unconditionally — the access-expr call
+    // node types double as plain property reads (C comment).
+    if lang == Language::PKL {
+        return extract_pkl_callee(node, source);
+    }
+
+    // Helm / Go templates: `include "x"` / `template "x"` → the named
+    // template (#338).
+    if lang == Language::GOTEMPLATE {
+        if let Some(g) = gotemplate_callee(node, source) {
+            return Some(g);
+        }
+    }
+
     // Constructor / instantiation nodes resolve to the constructed type.
     if let Some(ctor) = extract_constructor_callee(node, source, node.kind()) {
         return Some(ctor);
     }
+
     // Ruby `Widget.new(...)` → the receiver type (callee "new" never
     // resolves; the constructor lives in `initialize`).
     if lang == Language::RUBY {
@@ -293,23 +317,31 @@ pub fn extract_callee_name<'a>(
             }
         }
     }
-    // Python dict-dispatch `funcs["a"](v)`: emit the base identifier so the
-    // py-LSP resolves it and joins via `reason` (lsp_dict_dispatch).
-    if lang == Language::PYTHON && node.kind() == "call" {
-        if let Some(fnf) = node.child_by_field_name("function") {
-            if fnf.kind() == "subscript" {
-                let val = fnf.child_by_field_name("value");
-                let idx = fnf.child_by_field_name("subscript");
-                if let (Some(val), Some(idx)) = (val, idx) {
-                    if val.kind() == "identifier" && idx.kind() == "string" {
-                        return Some(crate::fqn::node_text(val, source).to_string());
-                    }
+
+    // #952: PHP facade route registrations (`Route::get(...)`) must carry
+    // the scope in the callee text, gated to the literal `Route` scope AND
+    // a route-method match.
+    if lang == Language::PHP && node.kind() == "scoped_call_expression" {
+        let scope = node.child_by_field_name("scope");
+        let mname = node.child_by_field_name("name");
+        if let (Some(scope), Some(mname)) = (scope, mname) {
+            let sc = crate::fqn::node_text(scope, source);
+            let mn = crate::fqn::node_text(mname, source);
+            if sc == "Route" {
+                let qual = format!("{sc}::{mn}");
+                if crate::service_patterns::service_pattern_route_method(&qual).is_some() {
+                    return Some(qual);
                 }
             }
         }
     }
+
     // Common field-based resolution first.
     if let Some(name) = extract_callee_from_fields(node, source) {
+        return Some(name);
+    }
+    // Language-specific patterns.
+    if let Some(name) = extract_callee_lang_specific(node, source, lang) {
         return Some(name);
     }
     // Generic fallback: first identifier child.
@@ -693,6 +725,1266 @@ pub fn extract_calls(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec, constants: &
     }
 }
 
+// ═══ Language-specific callee extractors (C extract_callee_lang_specific
+//     and its helpers) ═══════════════════════════════════════════════════
+
+/// Descend left-most through wrapper nodes to the first identifier-bearing
+/// leaf (C first_leaf_identifier): HDL callees nest under grammar wrappers
+/// (Verilog tf_call → simple_identifier; SystemVerilog → hierarchical →
+/// simple).
+fn first_leaf_identifier<'t>(node: tree_sitter::Node<'t>, source: &'t str) -> Option<String> {
+    let mut cur = Some(node);
+    for _ in 0..8 {
+        let n = cur?;
+        if matches!(
+            n.kind(),
+            "simple_identifier" | "identifier" | "word" | "name" | "qid"
+        ) {
+            let t = crate::fqn::node_text(n, source);
+            return (!t.is_empty()).then(|| t.to_string());
+        }
+        if n.named_child_count() == 0 {
+            return None;
+        }
+        cur = n.named_child(0);
+    }
+    None
+}
+
+/// Lean 4: is an `apply` inside a type annotation? (C
+/// lean_is_in_type_position): inside a binder → yes; at a declaration
+/// boundary, only when it starts before the end of the `type` field.
+fn lean_is_in_type_position(node: tree_sitter::Node<'_>) -> bool {
+    let mut cur = node.parent();
+    for _ in 0..20 {
+        // LEAN_MAX_PARENT_DEPTH
+        let Some(n) = cur else { return false };
+        let pk = n.kind();
+        if matches!(
+            pk,
+            "explicit_binder" | "implicit_binder" | "instance_binder"
+        ) {
+            return true;
+        }
+        if matches!(
+            pk,
+            "def" | "theorem" | "instance" | "abbrev" | "structure" | "inductive"
+        ) {
+            let Some(type_field) = n.child_by_field_name("type") else {
+                return false; // no type annotation → allow call
+            };
+            return (node.start_byte() as u32) <= type_field.end_byte() as u32;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// Fortran: `subroutine_call` → its `subroutine` field text.
+fn extract_fortran_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    let sub = node.child_by_field_name("subroutine")?;
+    Some(crate::fqn::node_text(sub, source).to_string())
+}
+
+/// Verilog/SystemVerilog HDL call shapes (C extract_hdl_callee).
+fn extract_hdl_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if !matches!(
+        node.kind(),
+        "function_subroutine_call" | "subroutine_call" | "tf_call" | "system_tf_call"
+    ) {
+        return None;
+    }
+    first_leaf_identifier(node, source)
+}
+
+/// VHDL (C extract_vhdl_callee): `add(x,1)` parses as
+/// `(name (library_function) (parenthesis_group ...))` — the callee is the
+/// parenthesis_group's preceding named sibling.
+fn extract_vhdl_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "parenthesis_group" {
+        return None;
+    }
+    let prev = node.prev_named_sibling()?;
+    if matches!(
+        prev.kind(),
+        "library_function" | "identifier" | "name" | "simple_name"
+    ) {
+        let t = crate::fqn::node_text(prev, source);
+        return (!t.is_empty()).then(|| t.to_string());
+    }
+    None
+}
+
+/// NASM (C extract_nasm_callee): call/jmp-style instructions only; the
+/// target label is the first operand word.
+fn extract_nasm_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() == "call_syntax_expression" {
+        return node
+            .child_by_field_name("base")
+            .and_then(|b| first_leaf_identifier(b, source));
+    }
+    if node.kind() != "actual_instruction" {
+        return None;
+    }
+    let mnem = node.child_by_field_name("instruction")?;
+    let m = crate::fqn::node_text(mnem, source);
+    if !matches!(m, "call" | "jmp" | "je" | "jne" | "jz" | "jnz") {
+        return None;
+    }
+    let ops = node.child_by_field_name("operands")?;
+    let first = ops.named_child(0)?;
+    first_leaf_identifier(first, source)
+}
+
+/// LLVM-IR (C extract_llvm_callee): `callee:` → value → var → global_var;
+/// strip the leading sigil.
+fn extract_llvm_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "instruction_call" {
+        return None;
+    }
+    let callee = node.child_by_field_name("callee")?;
+    let t = first_leaf_identifier(callee, source)?;
+    Some(t.trim_start_matches('@').to_string())
+}
+
+/// ObjC message_expression selector (C extract_objc_callee).
+fn extract_objc_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "message_expression" {
+        return None;
+    }
+    let sel = node.child_by_field_name("selector")?;
+    Some(crate::fqn::node_text(sel, source).to_string())
+}
+
+/// Erlang call: first child text (C extract_erlang_callee).
+fn extract_erlang_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "call" || node.child_count() == 0 {
+        return None;
+    }
+    Some(crate::fqn::node_text(node.child(0)?, source).to_string())
+}
+
+/// Haskell/OCaml/PureScript/Scala apply heads (C extract_fp_callee): walk
+/// the curried left spine iteratively; infix operators extract as `op`.
+fn extract_fp_callee<'a>(mut node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    let is_apply = |k: &str| matches!(k, "apply" | "application_expression" | "exp_apply");
+    while is_apply(node.kind()) && node.child_count() > 0 {
+        let callee = node.child(0)?;
+        let ck = callee.kind();
+        if matches!(
+            ck,
+            "identifier" | "variable" | "constructor" | "value_path" | "exp_name"
+        ) {
+            return Some(crate::fqn::node_text(callee, source).to_string());
+        }
+        if !is_apply(ck) {
+            break;
+        }
+        node = callee;
+    }
+    if matches!(node.kind(), "infix" | "infix_expression") {
+        if let Some(op) = node.child_by_field_name("operator") {
+            return Some(crate::fqn::node_text(op, source).to_string());
+        }
+        if node.child_count() >= 3 {
+            return Some(crate::fqn::node_text(node.child(1)?, source).to_string());
+        }
+    }
+    None
+}
+
+/// Wolfram apply head, skipping LHS of set definitions (C
+/// extract_wolfram_callee).
+fn extract_wolfram_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "set_delayed_top" | "set_top" | "set_delayed" | "set"
+        ) && parent.named_child_count() > 0
+            && parent.named_child(0) == Some(node)
+        {
+            return None;
+        }
+    }
+    let head = node.named_child(0)?;
+    if matches!(head.kind(), "user_symbol" | "builtin_symbol") {
+        return Some(crate::fqn::node_text(head, source).to_string());
+    }
+    None
+}
+
+/// Swift call/constructor first named child (C extract_swift_callee).
+fn extract_swift_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if !matches!(node.kind(), "call_expression" | "constructor_expression") {
+        return None;
+    }
+    let callee = node.named_child(0)?;
+    if matches!(callee.kind(), "simple_identifier" | "navigation_expression") {
+        return Some(crate::fqn::node_text(callee, source).to_string());
+    }
+    None
+}
+
+/// A Perl sub/method name is a bare identifier with '::' package separators
+/// (C perl_is_identifier_callee): tree-sitter-perl mis-parses config lines
+/// into call-shaped nodes whose "callee" is a dotted config token; rejecting
+/// non-identifier text stops those bogus CALLS edges.
+fn perl_is_identifier_callee(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let b = name.as_bytes();
+    if !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            i += 1;
+            continue;
+        }
+        if c == b':' {
+            // Only the '::' package separator: an adjacent pair, not a lone
+            // ':', ':::', or trailing '::'.
+            if i + 1 >= b.len() || b[i + 1] != b':' || (i + 2 < b.len() && b[i + 2] == b':') {
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        return false; // '.', space, quote, '/' → not a sub/method name
+    }
+    true
+}
+
+/// Scripting-language callees (C extract_scripting_callee): Elixir, Perl,
+/// PHP, Kotlin, MATLAB.
+fn extract_scripting_callee<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &'a str,
+    lang: Language,
+) -> Option<String> {
+    let nk = node.kind();
+    if lang == Language::ELIXIR && nk == "binary_operator" {
+        // The grammar exposes the operator as an exact field; reading bytes
+        // between operands captured binding punctuation in definition heads.
+        let op = node.child_by_field_name("operator")?;
+        let operator_name = crate::fqn::node_text(op, source);
+        if matches!(operator_name, "=" | "<-" | "->" | "\\\\" | "::" | "when") {
+            return None;
+        }
+        return Some(operator_name.to_string());
+    }
+    if lang == Language::ELIXIR && nk == "call" && node.child_count() > 0 {
+        let first = node.child(0)?;
+        if matches!(first.kind(), "identifier" | "dot") {
+            return Some(crate::fqn::node_text(first, source).to_string());
+        }
+        return None;
+    }
+    if lang == Language::PERL && node.child_count() > 0 {
+        // Pull the actual sub/method token: method → function → child(0).
+        let name_node = node
+            .child_by_field_name("method")
+            .or_else(|| node.child_by_field_name("function"))
+            .or_else(|| node.child(0))?;
+        let pn = crate::fqn::node_text(name_node, source);
+        return perl_is_identifier_callee(pn).then(|| pn.to_string());
+    }
+    if lang == Language::PHP {
+        let func_node = node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("name"))?;
+        return Some(crate::fqn::node_text(func_node, source).to_string());
+    }
+    if lang == Language::KOTLIN && node.child_count() > 0 {
+        return Some(crate::fqn::node_text(node.child(0)?, source).to_string());
+    }
+    if lang == Language::MATLAB && nk == "command" && node.child_count() > 0 {
+        return Some(crate::fqn::node_text(node.child(0)?, source).to_string());
+    }
+    None
+}
+
+/// Lisp dialects (C extract_lisp_callee): a call is a list/list_lit whose
+/// head is a symbol. Chialisp filters CLVM primitives, binder lists, and
+/// quoted data.
+fn extract_lisp_callee<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &'a str,
+    lang: Language,
+) -> Option<String> {
+    let nk = node.kind();
+    if nk != "list" && nk != "list_lit" {
+        return None;
+    }
+    let head = node.named_child(0)?;
+    if matches!(head.kind(), "symbol" | "sym_lit" | "identifier") {
+        let ht = crate::fqn::node_text(head, source);
+        if lang == Language::CHIALISP
+            && (chialisp_head_is_not_call(ht)
+                || chialisp_node_is_binder_list(node, source)
+                || helpers::lisp_node_in_quote(node, source))
+        {
+            return None;
+        }
+        return Some(ht.to_string());
+    }
+    None
+}
+
+/// F# (C extract_fsharp_callee): application_expression head is a
+/// long_identifier_or_op wrapper.
+fn extract_fsharp_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "application_expression" || node.named_child_count() == 0 {
+        return None;
+    }
+    let head = node.named_child(0)?;
+    if matches!(
+        head.kind(),
+        "long_identifier_or_op" | "long_identifier" | "identifier"
+    ) {
+        return Some(crate::fqn::node_text(head, source).to_string());
+    }
+    None
+}
+
+/// CSS call_expression (C extract_css_callee): `url(...)`/`calc(...)` carry
+/// the callee on a plain `function_name` child.
+fn extract_css_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let fnn = crate::fqn::find_child_by_kind(node, "function_name")?;
+    Some(crate::fqn::node_text(fnn, source).to_string())
+}
+
+/// Linker scripts (C extract_linkerscript_callee): `function:` field as a
+/// `symbol`.
+fn extract_linkerscript_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    (function.kind() == "symbol").then(|| crate::fqn::node_text(function, source).to_string())
+}
+
+/// PowerShell `command` node's `command_name` child (C
+/// extract_powershell_callee).
+fn extract_powershell_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "command" {
+        return None;
+    }
+    for i in 0..node.named_child_count() {
+        let c = node.named_child(i)?;
+        if c.kind() == "command_name" {
+            return Some(crate::fqn::node_text(c, source).to_string());
+        }
+    }
+    None
+}
+
+/// Ada (C extract_ada_callee): `name` field, else first name/identifier head.
+fn extract_ada_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if !matches!(node.kind(), "procedure_call_statement" | "function_call") {
+        return None;
+    }
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(crate::fqn::node_text(name, source).to_string());
+    }
+    let head = node.named_child(0)?;
+    if matches!(head.kind(), "name" | "identifier") {
+        return Some(crate::fqn::node_text(head, source).to_string());
+    }
+    None
+}
+
+/// PL/SQL (C extract_plsql_callee): ref_call → referenced_element with
+/// ref_name_parent.ref_name for package-qualified calls.
+fn extract_plsql_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "ref_call" {
+        return None;
+    }
+    let refr = crate::fqn::find_child_by_kind(node, "referenced_element")?;
+    let parent = refr.child_by_field_name("ref_name_parent");
+    let name = refr.child_by_field_name("ref_name");
+    if let (Some(p), Some(n)) = (parent, name) {
+        let pt = crate::fqn::node_text(p, source);
+        let nt = crate::fqn::node_text(n, source);
+        if !pt.is_empty() && !nt.is_empty() {
+            return Some(format!("{pt}.{nt}"));
+        }
+    }
+    if let Some(n) = name {
+        return Some(crate::fqn::node_text(n, source).to_string());
+    }
+    Some(crate::fqn::node_text(refr, source).to_string())
+}
+
+/// Solidity (C extract_solidity_callee): unwrap `expression` wrappers to the
+/// identifier/member.
+fn extract_solidity_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if !matches!(node.kind(), "call_expression" | "call") {
+        return None;
+    }
+    let mut head = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))?;
+    for _ in 0..4 {
+        let hk = head.kind();
+        if matches!(hk, "identifier" | "member_expression" | "member_access") {
+            return Some(crate::fqn::node_text(head, source).to_string());
+        }
+        if hk == "expression" && head.named_child_count() > 0 {
+            head = head.named_child(0)?;
+            continue;
+        }
+        break;
+    }
+    None
+}
+
+/// Groovy (C extract_groovy_callee): function_call's first named child is
+/// the callee identifier (child 0 is anonymous).
+fn extract_groovy_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if !matches!(node.kind(), "function_call" | "juxt_function_call") {
+        return None;
+    }
+    let head = node.named_child(0)?;
+    (head.kind() == "identifier").then(|| crate::fqn::node_text(head, source).to_string())
+}
+
+/// WGSL (C extract_wgsl_callee): nested type_constructor_or_function_call →
+/// type_declaration → identifier; descend left-most.
+fn extract_wgsl_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "type_constructor_or_function_call_expression" {
+        return None;
+    }
+    let mut head = node;
+    while head.named_child_count() > 0 && head.kind() != "identifier" {
+        head = head.named_child(0)?;
+    }
+    (head.kind() == "identifier").then(|| crate::fqn::node_text(head, source).to_string())
+}
+
+/// Dart (C extract_dart_callee): `selector` follows the callee identifier as
+/// a sibling; `new_expression`'s first named child is the type.
+fn extract_dart_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() == "selector" {
+        let prev = node.prev_named_sibling()?;
+        return (prev.kind() == "identifier")
+            .then(|| crate::fqn::node_text(prev, source).to_string());
+    }
+    if node.kind() == "new_expression" {
+        let head = node.named_child(0)?;
+        if matches!(head.kind(), "identifier" | "type_identifier") {
+            return Some(crate::fqn::node_text(head, source).to_string());
+        }
+    }
+    None
+}
+
+/// SCSS (C extract_scss_callee): `@include foo;` and `@function` call shapes.
+fn extract_scss_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() == "include_statement" {
+        let id = crate::fqn::find_child_by_kind(node, "identifier")?;
+        return Some(crate::fqn::node_text(id, source).to_string());
+    }
+    if node.kind() == "call_expression" {
+        let fnn = crate::fqn::find_child_by_kind(node, "function_name")?;
+        return Some(crate::fqn::node_text(fnn, source).to_string());
+    }
+    None
+}
+
+/// SQL invocation (C extract_sql_callee): object_reference > `name` field.
+fn extract_sql_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "invocation" {
+        return None;
+    }
+    let oref = crate::fqn::find_child_by_kind(node, "object_reference")?;
+    let nm = oref.child_by_field_name("name")?;
+    Some(crate::fqn::node_text(nm, source).to_string())
+}
+
+/// COBOL (C extract_cobol_callee): `CALL 'HELPER'` — the `x` field (or
+/// first string child) names the called program.
+fn extract_cobol_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "call_statement" {
+        return None;
+    }
+    let x = node
+        .child_by_field_name("x")
+        .or_else(|| crate::fqn::find_child_by_kind(node, "string"))?;
+    let text = crate::fqn::node_text(x, source);
+    strip_and_validate_string_arg(text).map(str::to_string)
+}
+
+/// Elm (C extract_elm_callee): target → value_expr → name (value_qid) →
+/// lower_case_identifier.
+fn extract_elm_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "function_call_expr" {
+        return None;
+    }
+    let target = node.child_by_field_name("target")?;
+    let ve = if target.kind() == "value_expr" {
+        target
+    } else {
+        crate::fqn::find_child_by_kind(target, "value_expr")?
+    };
+    let qid = ve
+        .child_by_field_name("name")
+        .or_else(|| crate::fqn::find_child_by_kind(ve, "value_qid"))?;
+    match crate::fqn::find_child_by_kind(qid, "lower_case_identifier") {
+        Some(id) => Some(crate::fqn::node_text(id, source).to_string()),
+        None => Some(crate::fqn::node_text(qid, source).to_string()), // module-qualified
+    }
+}
+
+/// Jsonnet (C extract_jsonnet_callee): functioncall's first `id` child.
+fn extract_jsonnet_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "functioncall" {
+        return None;
+    }
+    let id = crate::fqn::find_child_by_kind(node, "id")?;
+    Some(crate::fqn::node_text(id, source).to_string())
+}
+
+/// Nickel (C extract_nickel_callee): curried `applicative` chains — a real
+/// call has a `t2` argument field; only the outermost emits, keyed on the
+/// leftmost ident down the `t1` chain.
+fn extract_nickel_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "applicative" {
+        return None;
+    }
+    node.child_by_field_name("t2")?;
+    if node
+        .parent()
+        .map(|p| p.kind() == "applicative")
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut cur = Some(node);
+    for _ in 0..8 {
+        let n = cur?;
+        if n.kind() == "ident" {
+            return Some(crate::fqn::node_text(n, source).to_string());
+        }
+        let next = n.child_by_field_name("t1").or_else(|| n.named_child(0))?;
+        if next == n {
+            break;
+        }
+        cur = Some(next);
+    }
+    None
+}
+
+/// Pkl (C extract_pkl_callee): access-expr call nodes double as property
+/// reads; the `argumentList` child is the only discriminator. `newExpr`
+/// resolves to its declaredType.
+fn extract_pkl_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() == "newExpr" {
+        let dt = crate::fqn::find_child_by_kind(node, "declaredType")?;
+        return Some(crate::fqn::node_text(dt, source).to_string());
+    }
+    let qualified = node.kind() == "qualifiedAccessExpr";
+    if !qualified && node.kind() != "unqualifiedAccessExpr" {
+        return None;
+    }
+    crate::fqn::find_child_by_kind(node, "argumentList")?; // property read bail
+    let recv = node.child_by_field_name("receiver");
+    let mut name = None;
+    for i in 0..node.named_child_count() {
+        let child = node.named_child(i)?;
+        if recv == Some(child) {
+            continue;
+        }
+        if child.kind() == "identifier" {
+            name = Some(child);
+            break;
+        }
+    }
+    let name = name?;
+    let mn = crate::fqn::node_text(name, source);
+    if mn.is_empty() {
+        return None;
+    }
+    if !qualified {
+        return Some(mn.to_string());
+    }
+    let Some(recv) = recv else {
+        return Some(mn.to_string());
+    };
+    // Prefix only a plain-name receiver: `utils.fallback(a)` →
+    // "utils.fallback"; a receiver that is itself a call
+    // (`s.trim().toLowerCase()`) must NOT be prefixed.
+    if recv.kind() == "unqualifiedAccessExpr"
+        && crate::fqn::find_child_by_kind(recv, "argumentList").is_none()
+    {
+        let rt = crate::fqn::node_text(recv, source);
+        if !rt.is_empty() {
+            return Some(format!("{rt}.{mn}"));
+        }
+    }
+    Some(mn.to_string())
+}
+
+/// Typst (C extract_typst_callee): call's `item` field.
+fn extract_typst_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let item = node.child_by_field_name("item")?;
+    Some(crate::fqn::node_text(item, source).to_string())
+}
+
+/// Meson (C extract_meson_callee): normal_command's `command` field.
+fn extract_meson_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "normal_command" {
+        return None;
+    }
+    let cmd = node.child_by_field_name("command")?;
+    Some(crate::fqn::node_text(cmd, source).to_string())
+}
+
+/// Make (C extract_make_callee): `$(shell ...)` → literal "shell";
+/// function_call → its function field.
+fn extract_make_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    match node.kind() {
+        "shell_function" => Some("shell".to_string()),
+        "function_call" => {
+            let fnn = node
+                .child_by_field_name("function")
+                .or_else(|| node.named_child(0))?;
+            Some(crate::fqn::node_text(fnn, source).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Just (C extract_just_callee): recipe dependency's `name:` field.
+fn extract_just_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "dependency" {
+        return None;
+    }
+    let name = node
+        .child_by_field_name("name")
+        .or_else(|| node.named_child(0))?;
+    Some(crate::fqn::node_text(name, source).to_string())
+}
+
+/// Puppet (C extract_puppet_callee): `include foo` → literal "include";
+/// function_call's first identifier child.
+fn extract_puppet_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() == "include_statement" {
+        return Some("include".to_string());
+    }
+    if node.kind() == "function_call" {
+        let head = node.named_child(0)?;
+        if head.kind() == "identifier" {
+            return Some(crate::fqn::node_text(head, source).to_string());
+        }
+    }
+    None
+}
+
+/// Func (C extract_func_callee): function_application's `function` field.
+fn extract_func_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "function_application" {
+        return None;
+    }
+    let fnn = node.child_by_field_name("function")?;
+    Some(crate::fqn::node_text(fnn, source).to_string())
+}
+
+/// Nix (C extract_nix_callee): apply_expression `function:` chain down to
+/// variable_expression.name.
+fn extract_nix_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "apply_expression" {
+        return None;
+    }
+    let mut fnn = node.child_by_field_name("function")?;
+    for _ in 0..8 {
+        match fnn.kind() {
+            "apply_expression" => {
+                fnn = fnn.child_by_field_name("function")?;
+            }
+            "variable_expression" => {
+                let nm = fnn.child_by_field_name("name")?;
+                return Some(crate::fqn::node_text(nm, source).to_string());
+            }
+            "identifier" => {
+                return Some(crate::fqn::node_text(fnn, source).to_string());
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Agda (C extract_agda_callee): plain application is the exact adjacency
+/// shape `expr(atom, atom, ...)`; the head atom descends to a qid.
+fn extract_agda_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    if node.kind() != "expr" {
+        return None;
+    }
+    // All children named and all atoms.
+    if node.named_child_count() < 2 || node.child_count() != node.named_child_count() {
+        return None;
+    }
+    for i in 0..node.named_child_count() {
+        if node.named_child(i)?.kind() != "atom" {
+            return None;
+        }
+    }
+    // Head atom descends left-most to a qid.
+    let mut current = node.named_child(0)?;
+    for _ in 0..8 {
+        if current.kind() == "qid" {
+            return Some(crate::fqn::node_text(current, source).to_string());
+        }
+        if current.named_child_count() == 0 {
+            return None;
+        }
+        current = current.named_child(0)?;
+    }
+    None
+}
+
+/// Chialisp: a head atom that is a CLVM primitive/opcode or a
+/// syntax/binding/def keyword is NOT a call (C chialisp_head_is_not_call).
+/// `export`/`namespace` are here even though they are deliberately NOT
+/// definition heads: `(export foo)` names an already-defined function.
+fn chialisp_head_is_not_call(t: &str) -> bool {
+    const FILTERED: &[&str] = &[
+        // CLVM primitives (VM ops)
+        "q",
+        "a",
+        "i",
+        "c",
+        "f",
+        "r",
+        "l",
+        "x",
+        "=",
+        ">s",
+        "sha256",
+        "substr",
+        "strlen",
+        "concat",
+        "+",
+        "-",
+        "*",
+        "/",
+        "divmod",
+        ">",
+        "ash",
+        "lsh",
+        "logand",
+        "logior",
+        "logxor",
+        "lognot",
+        "point_add",
+        "pubkey_for_exp",
+        "not",
+        "any",
+        "all",
+        "softfork",
+        "coinid",
+        "g1_subtract",
+        "g1_multiply",
+        "g1_negate",
+        "g2_add",
+        "g2_subtract",
+        "g2_multiply",
+        "g2_negate",
+        "g1_map",
+        "g2_map",
+        "bls_pairing_identity",
+        "bls_verify",
+        "modpow",
+        "%",
+        "secp256k1_verify",
+        "secp256r1_verify",
+        "keccak256",
+        // Chialisp syntax / binding / intrinsics
+        "quote",
+        "qq",
+        "unquote",
+        "&rest",
+        "let",
+        "let*",
+        "assign",
+        "assign-inline",
+        "assign-lambda",
+        "lambda",
+        "mod",
+        "if",
+        "list",
+        "com",
+        "opt",
+        "@",
+        "@*env*",
+        "print",
+        // def / export / include heads
+        "defun",
+        "defun-inline",
+        "defmacro",
+        "defmac",
+        "defconstant",
+        "defconst",
+        "namespace",
+        "export",
+        "embed-file",
+        "compile-file",
+        "include",
+    ];
+    FILTERED.contains(&t)
+}
+
+/// Chialisp binder-position detection (C chialisp_node_is_binder_list): a
+/// `(defun NAME (params) ...)` parameter list, a `(mod (ARGS) ...)` arg
+/// list, a lambda parameter list, or a let binding container/pair. At most
+/// two levels, bounded on purpose.
+fn chialisp_node_is_binder_list(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let mut node = node;
+    for _ in 0..2 {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.kind() != "list" {
+            return false;
+        }
+        if let Some(head) = helpers::lisp_named_child_skip_comments(parent, 0) {
+            if head.kind() == "symbol" {
+                let ht = crate::fqn::node_text(head, source);
+                if matches!(ht, "defun" | "defun-inline" | "defmacro" | "defmac") {
+                    return helpers::lisp_named_child_skip_comments(parent, 2) == Some(node);
+                }
+                if matches!(ht, "mod" | "lambda" | "let" | "let*") {
+                    return helpers::lisp_named_child_skip_comments(parent, 1) == Some(node);
+                }
+                return false;
+            }
+        }
+        // The head is not a symbol: parent may be a let-binding container
+        // and node one of its pairs — retry one level up.
+        node = parent;
+    }
+    false
+}
+
+/// ObjectScript (C inline in extract_callee_lang_specific):
+/// ##class(Pkg.Class).Method(), $$label^routine extrinsic, $$$Macro.
+fn extract_objectscript_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    let nk = node.kind();
+    if nk == "class_method_call" {
+        let class_ref = crate::fqn::find_child_by_kind(node, "class_ref")?;
+        let method_name = crate::fqn::find_child_by_kind(node, "method_name")?;
+        let cname = crate::fqn::find_child_by_kind(class_ref, "class_name")?;
+        let cls = crate::fqn::node_text(cname, source);
+        if cls.is_empty() {
+            return None;
+        }
+        let mname_ident = method_name.named_child(0)?;
+        let meth = crate::fqn::node_text(mname_ident, source);
+        if meth.is_empty() {
+            return Some(cls.to_string());
+        }
+        return Some(format!("{cls}.{meth}"));
+    }
+    if nk == "extrinsic_function" || nk == "routine_tag_call" {
+        let line_ref = crate::fqn::find_child_by_kind(node, "line_ref")?;
+        return Some(crate::fqn::node_text(line_ref, source).to_string());
+    }
+    if nk == "macro" {
+        let raw = crate::fqn::node_text(node, source);
+        if !raw.starts_with("$$$") {
+            return None;
+        }
+        let name_start = &raw[3..];
+        let name = match name_start.find('(') {
+            Some(p) => &name_start[..p],
+            None => name_start,
+        };
+        if name.is_empty() {
+            return None;
+        }
+        return Some(format!("$$${name}"));
+    }
+    None
+}
+
+/// Go template / Helm (C gotemplate_callee): resolve `template "x"` /
+/// `include "x"` to the referenced named template (#338).
+fn gotemplate_callee<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    let strip =
+        |t: &str| -> Option<String> { strip_and_validate_string_arg(t).map(str::to_string) };
+    if node.kind() == "template_action" {
+        let s = crate::fqn::find_child_by_kind(node, "interpreted_string_literal")?;
+        return strip(crate::fqn::node_text(s, source));
+    }
+    if node.kind() == "function_call" {
+        let fnn = crate::fqn::find_child_by_kind(node, "identifier")?;
+        let fname = crate::fqn::node_text(fnn, source);
+        if !matches!(fname, "include" | "template" | "tpl") {
+            return None;
+        }
+        let args = node
+            .child_by_field_name("arguments")
+            .or_else(|| crate::fqn::find_child_by_kind(node, "argument_list"))?;
+        let s = crate::fqn::find_child_by_kind(args, "interpreted_string_literal")?;
+        return strip(crate::fqn::node_text(s, source));
+    }
+    None
+}
+
+/// Language-specific callee dispatch (C extract_callee_lang_specific).
+fn extract_callee_lang_specific<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &'a str,
+    lang: Language,
+) -> Option<String> {
+    let nk = node.kind();
+    match lang {
+        Language::FORTRAN => {
+            if nk == "subroutine_call" {
+                return extract_fortran_callee(node, source);
+            }
+        }
+        Language::JSONNET => {
+            return extract_jsonnet_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::NICKEL => {
+            return extract_nickel_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::TYPST => {
+            return extract_typst_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::MESON => {
+            return extract_meson_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::SCSS => {
+            return extract_scss_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::CSS => {
+            return extract_css_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::LINKERSCRIPT => {
+            return extract_linkerscript_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::SQL => {
+            return extract_sql_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::COBOL => {
+            return extract_cobol_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::ELM => {
+            return extract_elm_callee(node, source)
+                .or_else(|| extract_scripting_callee(node, source, lang));
+        }
+        Language::CLOJURE
+        | Language::COMMONLISP
+        | Language::SCHEME
+        | Language::FENNEL
+        | Language::RACKET
+        | Language::EMACSLISP
+        | Language::CHIALISP => return extract_lisp_callee(node, source, lang),
+        Language::FSHARP => return extract_fsharp_callee(node, source),
+        Language::POWERSHELL => return extract_powershell_callee(node, source),
+        Language::ADA => return extract_ada_callee(node, source),
+        Language::PLSQL => return extract_plsql_callee(node, source),
+        Language::SOLIDITY => return extract_solidity_callee(node, source),
+        Language::GROOVY => return extract_groovy_callee(node, source),
+        Language::WGSL => return extract_wgsl_callee(node, source),
+        Language::DART => return extract_dart_callee(node, source),
+        Language::OBJC => return extract_objc_callee(node, source),
+        Language::ERLANG => return extract_erlang_callee(node, source),
+        Language::HASKELL | Language::OCAML | Language::PURESCRIPT | Language::SCALA => {
+            return extract_fp_callee(node, source)
+        }
+        Language::WOLFRAM => {
+            if nk == "apply" {
+                return extract_wolfram_callee(node, source);
+            }
+        }
+        Language::SWIFT => return extract_swift_callee(node, source),
+        Language::VERILOG | Language::SYSTEMVERILOG => {
+            if let Some(c) = extract_hdl_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::VHDL => {
+            if let Some(c) = extract_vhdl_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::NASM => {
+            if let Some(c) = extract_nasm_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::LLVM_IR => {
+            if let Some(c) = extract_llvm_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::FUNC => {
+            if let Some(c) = extract_func_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::AGDA => {
+            if let Some(c) = extract_agda_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::NIX => {
+            if let Some(c) = extract_nix_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::MAKEFILE => {
+            if let Some(c) = extract_make_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::JUST => {
+            if let Some(c) = extract_just_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::PUPPET => {
+            if let Some(c) = extract_puppet_callee(node, source) {
+                return Some(c);
+            }
+        }
+        Language::OBJECTSCRIPT_UDL | Language::OBJECTSCRIPT_ROUTINE => {
+            return extract_objectscript_callee(node, source);
+        }
+        _ => {}
+    }
+    extract_scripting_callee(node, source, lang)
+}
+
+/// Is this Verilog subroutine_call already wrapped by a
+/// function_subroutine_call? (C is_nested_verilog_call_wrapper.)
+fn is_nested_verilog_call_wrapper(lang: Language, node: tree_sitter::Node<'_>) -> bool {
+    if lang != Language::VERILOG || node.kind() != "subroutine_call" {
+        return false;
+    }
+    node.parent()
+        .map(|p| p.kind() == "function_subroutine_call")
+        .unwrap_or(false)
+}
+
+/// Is `node` (a `list`) the name/params of a definition on this path (C
+/// call_node_is_definition_container + its language helpers)? Suppressed
+/// roles: Lisp definition forms, Julia/Typst/Agda definition heads, Elixir
+/// def calls.
+fn call_node_is_definition_container(
+    lang: Language,
+    node: tree_sitter::Node<'_>,
+    source: &str,
+) -> bool {
+    let kind = node.kind();
+    fn contains(outer: tree_sitter::Node<'_>, inner: tree_sitter::Node<'_>) -> bool {
+        outer.start_byte() <= inner.start_byte() && outer.end_byte() >= inner.end_byte()
+    }
+    fn text_in(node: tree_sitter::Node<'_>, source: &str, values: &[&str]) -> bool {
+        let t = crate::fqn::node_text(node, source);
+        values.contains(&t)
+    }
+    const CLOJURE_HEADS: &[&str] = &[
+        "defn",
+        "defn-",
+        "def",
+        "defmacro",
+        "defmulti",
+        "defmethod",
+        "defprotocol",
+        "defrecord",
+        "deftype",
+        "definterface",
+        "defonce",
+        "define",
+        "define-syntax",
+        "define-values",
+        "define-syntax-rule",
+        "define-struct",
+        "define-record-type",
+        "define/contract",
+        "struct",
+    ];
+    const CL_HEADS: &[&str] = &[
+        "defun",
+        "defmacro",
+        "defgeneric",
+        "defmethod",
+        "defvar",
+        "defparameter",
+        "defconstant",
+        "deftype",
+        "defstruct",
+        "defclass",
+    ];
+    const ELIXIR_STRUCTURAL: &[&str] = &["def", "defp", "defmacro", "defmodule"];
+    const ELIXIR_FUNCTION: &[&str] = &["def", "defp", "defmacro"];
+
+    let lisp_def_head = |head: tree_sitter::Node<'_>| {
+        text_in(
+            head,
+            source,
+            if lang == Language::COMMONLISP {
+                CL_HEADS
+            } else {
+                CLOJURE_HEADS
+            },
+        )
+    };
+
+    let lisp_list_is_def = |node: tree_sitter::Node<'_>| -> bool {
+        if node.named_child_count() > 0 && lisp_def_head(node.named_child(0).unwrap()) {
+            return true;
+        }
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            let pk = p.kind();
+            if lang == Language::COMMONLISP && matches!(pk, "defun_header" | "lambda_list") {
+                return true;
+            }
+            if lang == Language::EMACSLISP
+                && matches!(pk, "function_definition" | "macro_definition")
+            {
+                return p
+                    .child_by_field_name("parameters")
+                    .map(|params| contains(params, node))
+                    .unwrap_or(false);
+            }
+            if matches!(pk, "list" | "list_lit")
+                && p.named_child_count() >= 2
+                && lisp_def_head(p.named_child(0).unwrap())
+            {
+                // `(define (name args) body)` nests the signature list in
+                // the definition's second form.
+                return p
+                    .named_child(1)
+                    .map(|sig| contains(sig, node))
+                    .unwrap_or(false);
+            }
+            parent = p.parent();
+        }
+        false
+    };
+
+    let julia_is_def_head = |node: tree_sitter::Node<'_>| -> bool {
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            if matches!(
+                p.kind(),
+                "assignment" | "function_definition" | "short_function_definition"
+            ) {
+                return p.named_child(0).map(|h| contains(h, node)).unwrap_or(false);
+            }
+            parent = p.parent();
+        }
+        false
+    };
+
+    let typst_is_let_pattern = |node: tree_sitter::Node<'_>| -> bool {
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            if p.kind() == "let" {
+                return p
+                    .child_by_field_name("pattern")
+                    .map(|pat| contains(pat, node))
+                    .unwrap_or(false);
+            }
+            parent = p.parent();
+        }
+        false
+    };
+
+    let agda_is_def_role = |node: tree_sitter::Node<'_>| -> bool {
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            if matches!(
+                p.kind(),
+                "lhs"
+                    | "typed_binding"
+                    | "signature"
+                    | "type_signature"
+                    | "data_signature"
+                    | "record_signature"
+            ) {
+                return true;
+            }
+            if p.kind() == "function" {
+                // A ':' function line is a type signature; '=' definitions
+                // keep rhs applications as executable calls.
+                let has_colon = (0..p.child_count())
+                    .any(|i| p.child(i).map(|c| c.kind() == ":").unwrap_or(false));
+                return has_colon;
+            }
+            parent = p.parent();
+        }
+        false
+    };
+
+    let elixir_is_def_role = |node: tree_sitter::Node<'_>| -> bool {
+        if node.child_count() > 0 && text_in(node.child(0).unwrap(), source, ELIXIR_STRUCTURAL) {
+            return true;
+        }
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            if p.kind() != "call"
+                || p.child_count() == 0
+                || !text_in(p.child(0).unwrap(), source, ELIXIR_FUNCTION)
+            {
+                parent = p.parent();
+                continue;
+            }
+            let mut arguments = p.child_by_field_name("arguments");
+            if arguments.is_none() && p.child_count() > 1 {
+                arguments = p.child(1);
+            }
+            let signature = arguments
+                .filter(|a| a.named_child_count() > 0)
+                .and_then(|a| a.named_child(0))
+                .or(arguments);
+            return signature == Some(node);
+        }
+        false
+    };
+
+    match lang {
+        Language::CLOJURE
+        | Language::SCHEME
+        | Language::RACKET
+        | Language::COMMONLISP
+        | Language::EMACSLISP => matches!(kind, "list" | "list_lit") && lisp_list_is_def(node),
+        Language::JULIA => {
+            matches!(kind, "call_expression" | "broadcast_call_expression")
+                && julia_is_def_head(node)
+        }
+        Language::TYPST => kind == "call" && typst_is_let_pattern(node),
+        Language::AGDA => kind == "expr" && agda_is_def_role(node),
+        Language::ELIXIR => kind == "call" && elixir_is_def_role(node),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,5 +2116,77 @@ mod tests {
         assert_eq!(strip_and_validate_string_arg("\"\""), None);
         let long = format!("\"{}\"", "x".repeat(600));
         assert_eq!(strip_and_validate_string_arg(&long), None);
+    }
+
+    // ── Long-tail language extractors ──
+
+    #[test]
+    fn lisp_call_heads() {
+        let src = "(other-fn 1 2)\n(greet x)\n";
+        let calls = run(Language::CLOJURE, src, "a.clj");
+        let names: Vec<&str> = calls.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(names.contains(&"other-fn"), "{names:?}");
+        assert!(names.contains(&"greet"), "{names:?}");
+        // Definition heads are not calls.
+        let src2 = "(defn greet [x] (helper x))\n";
+        let calls2 = run(Language::CLOJURE, src2, "b.clj");
+        let names2: Vec<&str> = calls2.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(!names2.contains(&"defn"), "{names2:?}");
+        assert!(names2.contains(&"helper"), "{names2:?}");
+    }
+
+    #[test]
+    fn chialisp_primitives_filtered() {
+        // No chialisp grammar crate exists on crates.io (the C vendors it),
+        // so parse() returns None and the run helper yields nothing — the
+        // same empty-result behavior the C has for any language without a
+        // grammar. The filter logic itself is exercised through
+        // chialisp_head_is_not_call / chialisp_node_is_binder_list below.
+        let src = "(sha256 data)\n(mod (params) (helper params))\n";
+        let Some(_tree) = crate::ts::parse(Language::CHIALISP, src) else {
+            assert!(chialisp_head_is_not_call("sha256"));
+            assert!(chialisp_head_is_not_call("defun"));
+            assert!(!chialisp_head_is_not_call("helper"));
+            assert!(chialisp_head_is_not_call("q"));
+            return;
+        };
+        let calls = run(Language::CHIALISP, src, "a.clsp");
+        let names: Vec<&str> = calls.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(
+            !names.contains(&"sha256"),
+            "CLVM op is not a call: {names:?}"
+        );
+        assert!(!names.contains(&"mod"), "def head is not a call");
+        assert!(names.contains(&"helper"), "real helper resolves: {names:?}");
+    }
+
+    #[test]
+    fn nix_apply_expression_callee() {
+        let src = "let result = addOne 5;\n";
+        let calls = run(Language::NIX, src, "a.nix");
+        let names: Vec<&str> = calls.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(names.contains(&"addOne"), "{names:?}");
+    }
+
+    #[test]
+    fn make_shell_and_puppet_include() {
+        let src = "$(shell ls)\n";
+        let calls = run(Language::MAKEFILE, src, "Makefile");
+        let names: Vec<&str> = calls.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(names.contains(&"shell"), "{names:?}");
+
+        let src2 = "include myclass\n";
+        let calls2 = run(Language::PUPPET, src2, "a.pp");
+        let names2: Vec<&str> = calls2.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(names2.contains(&"include"), "{names2:?}");
+    }
+
+    #[test]
+    fn julia_definition_head_not_call() {
+        let src = "greet(x) = helper(x)\n";
+        let calls = run(Language::JULIA, src, "a.jl");
+        let names: Vec<&str> = calls.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(!names.contains(&"greet"), "definition head: {names:?}");
+        assert!(names.contains(&"helper"), "body call captured: {names:?}");
     }
 }

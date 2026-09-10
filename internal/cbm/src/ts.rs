@@ -58,6 +58,10 @@ fn resolve_grammar(crate_name: &str) -> Option<tree_sitter::Language> {
         "hcl" => Some(tree_sitter_hcl::LANGUAGE.into()),
         "matlab" => Some(tree_sitter_matlab::LANGUAGE.into()),
         "scss" => Some(tree_sitter_scss::language()),
+        "nix" => Some(tree_sitter_nix::LANGUAGE.into()),
+        "make" => Some(tree_sitter_make::LANGUAGE.into()),
+        "puppet" => Some(tree_sitter_puppet::LANGUAGE.into()),
+        "julia" => Some(tree_sitter_julia::LANGUAGE.into()),
         _ => None,
     }
 }
