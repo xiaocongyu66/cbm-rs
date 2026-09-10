@@ -18,6 +18,10 @@ tree-sitter-yaml = { workspace = true }
 tree-sitter-c-sharp = { workspace = true }
 tree-sitter-elixir = { workspace = true }
 tree-sitter-ruby = { workspace = true }
+tree-sitter-clojure = { workspace = true }
+tree-sitter-hcl = { workspace = true }
+tree-sitter-matlab = { workspace = true }
+tree-sitter-scss = { workspace = true }
 xxhash-rust = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }

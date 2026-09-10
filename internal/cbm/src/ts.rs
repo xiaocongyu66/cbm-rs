@@ -54,6 +54,10 @@ fn resolve_grammar(crate_name: &str) -> Option<tree_sitter::Language> {
         "c-sharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         "elixir" => Some(tree_sitter_elixir::LANGUAGE.into()),
         "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
+        "clojure" => Some(tree_sitter_clojure::LANGUAGE.into()),
+        "hcl" => Some(tree_sitter_hcl::LANGUAGE.into()),
+        "matlab" => Some(tree_sitter_matlab::LANGUAGE.into()),
+        "scss" => Some(tree_sitter_scss::language()),
         _ => None,
     }
 }

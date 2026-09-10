@@ -475,6 +475,77 @@ const PUPPET_KEYWORDS: &[&str] = &[
 const PYTHON_RESOLVABLE_BUILTINS: &[&str] =
     &["len", "print", "str", "int", "list", "dict", "range"];
 
+/// Ancestor-walk bound for lisp_node_in_quote: a quote nest deeper than
+/// this is pathological input, not Chialisp (C CBM_LISP_QUOTE_ANCESTOR_MAX).
+const LISP_QUOTE_ANCESTOR_MAX: usize = 256;
+
+/// True when any ancestor list of `node` is headed by a quote symbol
+/// (`q`/`quote`/`qq`) — its contents are DATA, not code, so no def and no
+/// call may be minted from them (C cbm_lisp_node_in_quote).
+pub fn lisp_node_in_quote(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let mut cur = node.parent();
+    for _ in 0..LISP_QUOTE_ANCESTOR_MAX {
+        let Some(cur_node) = cur else { return false };
+        let ck = cur_node.kind();
+        if (ck == "list" || ck == "list_lit") && cur_node.named_child_count() > 0 {
+            if let Some(h) = cur_node.named_child(0) {
+                let hk = h.kind();
+                if hk == "symbol" || hk == "sym_lit" {
+                    let ht = crate::fqn::node_text(h, source);
+                    if ht == "q" || ht == "quote" || ht == "qq" {
+                        return true;
+                    }
+                }
+            }
+        }
+        cur = cur_node.parent();
+    }
+    false
+}
+
+/// The `want`-th named child of `node`, skipping `comment` nodes. Comments
+/// are named in the s-expression grammars and so occupy named-child
+/// indices: a comment between a def head and its name shifts every later
+/// index by one. Definition extraction and call-scope attribution MUST use
+/// this same skipping rule or they desynchronise on exactly the files that
+/// carry doc comments (C cbm_lisp_named_child_skip_comments).
+pub fn lisp_named_child_skip_comments<'t>(
+    node: tree_sitter::Node<'t>,
+    want: usize,
+) -> Option<tree_sitter::Node<'t>> {
+    let mut seen = 0usize;
+    for i in 0..node.named_child_count() {
+        let c = node.named_child(i)?;
+        if c.kind() == "comment" {
+            continue;
+        }
+        if seen == want {
+            return Some(c);
+        }
+        seen += 1;
+    }
+    None
+}
+
+/// Chialisp definition-form heads (C cbm_chialisp_is_def_head).
+/// `export` and `namespace` are absent ON PURPOSE: `(export foo)` re-exports
+/// a function `(defun foo ...)` already defined in the same file, so
+/// admitting it here mints a SECOND node for the same symbol.
+pub fn chialisp_is_def_head(t: &str) -> bool {
+    matches!(
+        t,
+        "mod"
+            | "defun"
+            | "defun-inline"
+            | "defmacro"
+            | "defmac"
+            | "defconstant"
+            | "defconst"
+            | "embed-file"
+            | "compile-file"
+    )
+}
+
 /// Is this a language keyword (skip as callee/usage)?
 pub fn is_keyword(name: &str, lang: Language) -> bool {
     if name.is_empty() {

@@ -712,6 +712,822 @@ pub fn extract_usages(ctx: &mut ExtractCtx<'_>, spec: &LanguageSpec) {
     }
 }
 
+// ── Occurrence policies (C CBMOccurrencePolicy / occurrence_specs) ──
+
+/// Occurrence semantics that evolve per language without touching the
+/// positional CBMLangSpec (C CBMOccurrencePolicy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum OccurrencePolicy {
+    #[default]
+    Standard = 0,
+    LispDef,
+    CommonlispDefun,
+    FennelFn,
+    ElixirDef,
+    JuliaFunction,
+    WolframSet,
+    TypstLet,
+    AgdaFunction,
+    TlaplusOperator,
+    CobolMove,
+    HclAttribute,
+    ElmValue,
+    RescriptLet,
+    PurescriptLhs,
+    NickelLet,
+    ErlangClause,
+    NixFunction,
+    MatlabArguments,
+    LeanBinder,
+    PascalProc,
+    TealFunction,
+    VhdlInterface,
+    PineFunction,
+    LlvmFunction,
+    PklDeclaration,
+}
+
+/// Per-language occurrence spec (C CBMOccurrenceSpec): the whole-binding
+/// container kinds beyond the common set, write-node kinds, the policy, and
+/// whether a container's first named child is its write target.
+#[derive(Debug, Clone, Copy)]
+pub struct OccurrenceSpec {
+    pub whole_binding_nodes: &'static [&'static str],
+    pub write_nodes: &'static [&'static str],
+    pub policy: OccurrencePolicy,
+    pub first_named_child_is_write: bool,
+}
+
+const SQL_BINDING_NODES: &[&str] = &["function_argument"];
+const HASKELL_BINDING_NODES: &[&str] = &["patterns"];
+const FSHARP_BINDING_NODES: &[&str] = &[
+    "function_declaration_left",
+    "value_declaration_left",
+    "argument_patterns",
+];
+const CRYSTAL_BINDING_NODES: &[&str] = &["param_list"];
+const AWK_BINDING_NODES: &[&str] = &["param_list"];
+const TEAL_BINDING_NODES: &[&str] = &["function_signature"];
+const SYSTEMVERILOG_BINDING_NODES: &[&str] = &["tf_port_item", "tf_port_item1"];
+const RESCRIPT_BINDING_NODES: &[&str] = &["formal_parameters", "labeled_parameter", "parameter"];
+const PURESCRIPT_BINDING_NODES: &[&str] = &["bind_pattern", "pattern", "patterns"];
+const NICKEL_BINDING_NODES: &[&str] = &["pattern_fun"];
+const JSONNET_BINDING_NODES: &[&str] = &["param"];
+const LLVM_BINDING_NODES: &[&str] = &["function_header"];
+const LINKERSCRIPT_WRITE_NODES: &[&str] = &["assignment"];
+const MESON_WRITE_NODES: &[&str] = &["operatorunit"];
+const GN_WRITE_NODES: &[&str] = &["assignment_statement"];
+const OBJECTSCRIPT_BINDING_NODES: &[&str] = &["argument", "tag_parameter"];
+const OBJECTSCRIPT_WRITE_NODES: &[&str] = &["set_argument"];
+
+const STD: OccurrenceSpec = OccurrenceSpec {
+    whole_binding_nodes: &[],
+    write_nodes: &[],
+    policy: OccurrencePolicy::Standard,
+    first_named_child_is_write: false,
+};
+
+/// Parallel to lang_specs (C occurrence_specs[CBM_LANG_COUNT]); languages
+/// not listed use STANDARD with no extra tables.
+pub fn occurrence_spec(lang: Language) -> OccurrenceSpec {
+    let (whole, write, policy, first_write): (
+        &'static [&'static str],
+        &'static [&'static str],
+        OccurrencePolicy,
+        bool,
+    ) = match lang {
+        Language::SQL => (SQL_BINDING_NODES, &[], OccurrencePolicy::Standard, false),
+        Language::CLOJURE | Language::SCHEME | Language::RACKET | Language::CHIALISP => {
+            (&[], &[], OccurrencePolicy::LispDef, false)
+        }
+        Language::COMMONLISP => (&[], &[], OccurrencePolicy::CommonlispDefun, false),
+        Language::FENNEL => (&[], &[], OccurrencePolicy::FennelFn, false),
+        Language::ELIXIR => (&[], &[], OccurrencePolicy::ElixirDef, false),
+        Language::JULIA => (&[], &[], OccurrencePolicy::JuliaFunction, false),
+        Language::WOLFRAM => (&[], &[], OccurrencePolicy::WolframSet, false),
+        Language::TYPST => (&[], &[], OccurrencePolicy::TypstLet, false),
+        Language::AGDA => (&[], &[], OccurrencePolicy::AgdaFunction, false),
+        Language::TLAPLUS => (&[], &[], OccurrencePolicy::TlaplusOperator, false),
+        Language::COBOL => (&[], &[], OccurrencePolicy::CobolMove, false),
+        Language::HCL => (&[], &[], OccurrencePolicy::HclAttribute, false),
+        Language::ELM => (&[], &[], OccurrencePolicy::ElmValue, false),
+        Language::RESCRIPT => (
+            RESCRIPT_BINDING_NODES,
+            &[],
+            OccurrencePolicy::RescriptLet,
+            false,
+        ),
+        Language::PURESCRIPT => (
+            PURESCRIPT_BINDING_NODES,
+            &[],
+            OccurrencePolicy::PurescriptLhs,
+            false,
+        ),
+        Language::NICKEL => (
+            NICKEL_BINDING_NODES,
+            &[],
+            OccurrencePolicy::NickelLet,
+            false,
+        ),
+        Language::JSONNET => (
+            JSONNET_BINDING_NODES,
+            &[],
+            OccurrencePolicy::Standard,
+            false,
+        ),
+        Language::HASKELL => (
+            HASKELL_BINDING_NODES,
+            &[],
+            OccurrencePolicy::Standard,
+            false,
+        ),
+        Language::ERLANG => (&[], &[], OccurrencePolicy::ErlangClause, false),
+        Language::FSHARP => (FSHARP_BINDING_NODES, &[], OccurrencePolicy::Standard, false),
+        Language::NIX => (&[], &[], OccurrencePolicy::NixFunction, false),
+        Language::MATLAB => (&[], &[], OccurrencePolicy::MatlabArguments, false),
+        Language::LEAN => (&[], &[], OccurrencePolicy::LeanBinder, false),
+        Language::PASCAL => (&[], &[], OccurrencePolicy::PascalProc, false),
+        Language::VERILOG => (
+            SYSTEMVERILOG_BINDING_NODES,
+            &[],
+            OccurrencePolicy::Standard,
+            false,
+        ),
+        Language::AWK => (AWK_BINDING_NODES, &[], OccurrencePolicy::Standard, false),
+        Language::CRYSTAL => (
+            CRYSTAL_BINDING_NODES,
+            &[],
+            OccurrencePolicy::Standard,
+            false,
+        ),
+        Language::TEAL => (
+            TEAL_BINDING_NODES,
+            &[],
+            OccurrencePolicy::TealFunction,
+            false,
+        ),
+        Language::VHDL => (&[], &[], OccurrencePolicy::VhdlInterface, false),
+        Language::SYSTEMVERILOG => (
+            SYSTEMVERILOG_BINDING_NODES,
+            &[],
+            OccurrencePolicy::Standard,
+            false,
+        ),
+        Language::PINE => (&[], &[], OccurrencePolicy::PineFunction, false),
+        Language::PUPPET => (&[], &[], OccurrencePolicy::Standard, true),
+        Language::LLVM_IR => (
+            LLVM_BINDING_NODES,
+            &[],
+            OccurrencePolicy::LlvmFunction,
+            false,
+        ),
+        Language::PKL => (&[], &[], OccurrencePolicy::PklDeclaration, false),
+        Language::MESON => (&[], MESON_WRITE_NODES, OccurrencePolicy::Standard, true),
+        Language::GN => (&[], GN_WRITE_NODES, OccurrencePolicy::Standard, true),
+        Language::LINKERSCRIPT => (
+            &[],
+            LINKERSCRIPT_WRITE_NODES,
+            OccurrencePolicy::Standard,
+            true,
+        ),
+        Language::OBJECTSCRIPT_UDL | Language::OBJECTSCRIPT_ROUTINE => (
+            OBJECTSCRIPT_BINDING_NODES,
+            OBJECTSCRIPT_WRITE_NODES,
+            OccurrencePolicy::Standard,
+            true,
+        ),
+        _ => (&[], &[], OccurrencePolicy::Standard, false),
+    };
+    if policy == OccurrencePolicy::Standard && whole.is_empty() && write.is_empty() && !first_write
+    {
+        STD
+    } else {
+        OccurrenceSpec {
+            whole_binding_nodes: whole,
+            write_nodes: write,
+            policy,
+            first_named_child_is_write: first_write,
+        }
+    }
+}
+
+fn named_child_contains(
+    parent: tree_sitter::Node<'_>,
+    index: usize,
+    node: tree_sitter::Node<'_>,
+) -> bool {
+    parent
+        .named_child(index)
+        .map(|c| node_contains(c, node))
+        .unwrap_or(false)
+}
+
+/// Every direct child whose field role is `field` contains `node` (C
+/// any_field_contains_node): repeated/inherited fields need all instances.
+fn any_field_contains_node(
+    parent: tree_sitter::Node<'_>,
+    field: &str,
+    node: tree_sitter::Node<'_>,
+) -> bool {
+    let mut cursor = parent.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+    loop {
+        let matched = cursor.field_name().map(|f| f == field).unwrap_or(false)
+            && node_contains(cursor.node(), node);
+        if matched {
+            return true;
+        }
+        if !cursor.goto_next_sibling() {
+            return false;
+        }
+    }
+}
+
+fn text_equals(node: tree_sitter::Node<'_>, expected: &str, source: &str) -> bool {
+    crate::fqn::node_text(node, source) == expected
+}
+
+/// Lisp def heads (Clojure/Scheme/Racket) (C lisp_def_head).
+fn lisp_def_head(t: &str) -> bool {
+    matches!(
+        t,
+        "defn"
+            | "defn-"
+            | "def"
+            | "defmacro"
+            | "defmulti"
+            | "defmethod"
+            | "defprotocol"
+            | "defrecord"
+            | "deftype"
+            | "definterface"
+            | "defonce"
+            | "define"
+            | "define-syntax"
+            | "define-values"
+            | "define-struct"
+            | "define-record-type"
+            | "define/contract"
+            | "struct"
+    )
+}
+
+/// Chialisp heads whose THIRD form is a parameter list (C
+/// chialisp_head_binds_params_at_2): `(defun NAME (params) body)`.
+/// Deliberately not `defconstant` — its third form is the VALUE expression.
+fn chialisp_head_binds_params_at_2(head: &str) -> bool {
+    matches!(head, "defun" | "defun-inline" | "defmacro" | "defmac")
+}
+
+fn is_lisp_def_binding(node: tree_sitter::Node<'_>, lang: Language, source: &str) -> bool {
+    let chialisp = lang == Language::CHIALISP;
+    let mut form = node.parent();
+    while let Some(form_node) = form {
+        let kind = form_node.kind();
+        if (kind != "list" && kind != "list_lit") || form_node.named_child_count() < 2 {
+            form = form_node.parent();
+            continue;
+        }
+        // Chialisp reads its head through the comment-skipping accessor (C).
+        let head_node = if chialisp {
+            helpers::lisp_named_child_skip_comments(form_node, 0)
+        } else {
+            form_node.named_child(0)
+        };
+        let Some(head_node) = head_node else {
+            form = form_node.parent();
+            continue;
+        };
+        let head = crate::fqn::node_text(head_node, source);
+        let is_def = if chialisp {
+            helpers::chialisp_is_def_head(head)
+        } else {
+            lisp_def_head(head)
+        };
+        if !is_def {
+            form = form_node.parent();
+            continue;
+        }
+        // A def head inside `(q ...)`/`(qq ...)` is quoted DATA (shared rule
+        // with extract_defs — the helpers' quote check covers this upstream;
+        // here the binding scan inside quotes never fires because quote
+        // contents were skipped as data by the walkers).
+        if node_contains(head_node, node) || named_child_contains(form_node, 1, node) {
+            return true;
+        }
+        if (lang == Language::CLOJURE || (chialisp && chialisp_head_binds_params_at_2(head)))
+            && form_node.named_child_count() > 2
+            && named_child_contains(form_node, 2, node)
+        {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+fn is_fennel_fn_binding(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let mut form = node.parent();
+    while let Some(form_node) = form {
+        if form_node.kind() == "list"
+            && form_node.named_child_count() >= 2
+            && form_node
+                .named_child(0)
+                .map(|h| text_equals(h, "fn", source))
+                .unwrap_or(false)
+        {
+            let first = form_node.named_child(1).unwrap();
+            let anonymous = matches!(first.kind(), "sequence" | "table" | "vector");
+            if anonymous {
+                return named_child_contains(form_node, 0, node) || node_contains(first, node);
+            }
+            return named_child_contains(form_node, 0, node)
+                || node_contains(first, node)
+                || (form_node.named_child_count() > 2 && named_child_contains(form_node, 2, node));
+        }
+        form = form_node.parent();
+    }
+    false
+}
+
+fn is_elixir_def_binding(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let mut form = node.parent();
+    while let Some(form_node) = form {
+        if form_node.kind() == "call" && form_node.named_child_count() >= 2 {
+            let head = form_node.named_child(0).unwrap();
+            let head_text = crate::fqn::node_text(head, source);
+            if head_text == "def" || head_text == "defp" || head_text == "defmacro" {
+                let mut arguments = form_node.child_by_field_name("arguments");
+                if arguments
+                    .map(|a| a.named_child_count() == 0)
+                    .unwrap_or(true)
+                {
+                    arguments = form_node.named_child(1);
+                }
+                let signature = arguments
+                    .filter(|a| a.named_child_count() > 0)
+                    .and_then(|a| a.named_child(0))
+                    .or(arguments);
+                return node_contains(head, node)
+                    || signature.map(|s| node_contains(s, node)).unwrap_or(false);
+            }
+        }
+        form = form_node.parent();
+    }
+    false
+}
+
+fn is_first_named_part_of(node: tree_sitter::Node<'_>, container_kind: &str) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == container_kind {
+            return named_child_contains(p, 0, node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_wolfram_lhs(node: tree_sitter::Node<'_>) -> bool {
+    const SET_NODES: &[&str] = &[
+        "set",
+        "set_top",
+        "set_delayed",
+        "set_delayed_top",
+        "tag_set",
+        "tag_set_top",
+        "tag_set_delayed",
+        "tag_set_delayed_top",
+        "up_set",
+        "up_set_top",
+        "up_set_delayed",
+        "up_set_delayed_top",
+    ];
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if SET_NODES.contains(&p.kind()) {
+            return named_child_contains(p, 0, node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_tlaplus_binding(node: tree_sitter::Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        match p.kind() {
+            "operator_definition" => {
+                // `name:` is the callable declaration; every repeated
+                // `parameter:` field is a function-wide lexical binder.
+                return any_field_contains_node(p, "parameter", node);
+            }
+            "function_definition" | "bounded_quantification" => {
+                // `F[x \in S] == ...`: only quantifier_bound.intro binds.
+                let mut bound = node.parent();
+                while let Some(b) = bound {
+                    if b == p {
+                        break;
+                    }
+                    if b.kind() == "quantifier_bound" {
+                        return any_field_contains_node(b, "intro", node);
+                    }
+                    bound = b.parent();
+                }
+                return false;
+            }
+            "unbounded_quantification" => {
+                return any_field_contains_node(p, "intro", node);
+            }
+            _ => {}
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_cobol_move_destination(node: tree_sitter::Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == "move_statement" {
+            if field_contains_node(p, "destination", node) || field_contains_node(p, "target", node)
+            {
+                return true;
+            }
+            let count = p.named_child_count();
+            return count > 1 && named_child_contains(p, count - 1, node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+#[allow(dead_code)] // consumed by the unified-walk handler when it lands
+fn is_perl_lexical_declaration_binding(node: tree_sitter::Node<'_>) -> bool {
+    // Perl permits repeated `variables:` fields for `my ($a, $b)`.
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        match p.kind() {
+            "variable_declaration" => return any_field_contains_node(p, "variables", node),
+            "assignment_expression" => return false,
+            _ => {}
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+#[allow(dead_code)] // consumed by the unified-walk handler when it lands
+fn is_cmake_function_parameter(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() != "unquoted_argument" {
+        return false;
+    }
+    let Some(argument) = node.parent() else {
+        return false;
+    };
+    let Some(arguments) = argument.parent() else {
+        return false;
+    };
+    let Some(command) = arguments.parent() else {
+        return false;
+    };
+    if argument.kind() != "argument"
+        || arguments.kind() != "argument_list"
+        || !matches!(command.kind(), "function_command" | "macro_command")
+    {
+        return false;
+    }
+    let count = arguments.named_child_count();
+    for i in 1..count {
+        if let Some(c) = arguments.named_child(i) {
+            if node_contains(c, node) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[allow(dead_code)] // consumed by the unified-walk handler when it lands
+fn is_tcl_procedure_parameter(node: tree_sitter::Node<'_>) -> bool {
+    let Some(argument) = node.parent() else {
+        return false;
+    };
+    if argument.kind() != "argument" || !any_field_contains_node(argument, "name", node) {
+        return false;
+    }
+    let Some(arguments) = argument.parent() else {
+        return false;
+    };
+    let Some(procedure) = arguments.parent() else {
+        return false;
+    };
+    arguments.kind() == "arguments"
+        && procedure.kind() == "procedure"
+        && any_field_contains_node(procedure, "arguments", node)
+}
+
+#[allow(dead_code)] // consumed by the unified-walk handler when it lands
+fn cfml_argument_tag_name_binding(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    if node.kind() != "attribute_value" {
+        return false;
+    }
+    let Some(quoted) = node.parent() else {
+        return false;
+    };
+    let Some(attribute) = quoted.parent() else {
+        return false;
+    };
+    if attribute.kind() != "cf_attribute" {
+        return false;
+    }
+    let Some(attribute_name) = crate::fqn::find_child_by_kind(attribute, "cf_attribute_name")
+    else {
+        return false;
+    };
+    if !crate::fqn::node_text(attribute_name, source).eq_ignore_ascii_case("name") {
+        return false;
+    }
+    let Some(tag) = attribute.parent() else {
+        return false;
+    };
+    if tag.kind() != "cf_selfclose_tag" {
+        return false;
+    }
+    let tag_text = crate::fqn::node_text(tag, source);
+    const ARGUMENT_TAG: &str = "<cfargument";
+    if !tag_text
+        .get(..ARGUMENT_TAG.len())
+        .map(|p| p.eq_ignore_ascii_case(ARGUMENT_TAG))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let mut parent = tag.parent();
+    while let Some(p) = parent {
+        if p.kind() == "cf_function_tag" {
+            return true;
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+#[allow(dead_code)] // consumed by the unified-walk handler when it lands
+fn is_exact_language_binding(node: tree_sitter::Node<'_>, lang: Language, source: &str) -> bool {
+    let kind = node.kind();
+    match lang {
+        Language::OCAML => {
+            if kind != "value_pattern" {
+                return false;
+            }
+            node.parent()
+                .map(|p| p.kind() == "parameter" && field_contains_node(p, "pattern", node))
+                .unwrap_or(false)
+        }
+        Language::SCSS => {
+            // crates.io grammar wraps parameters in `variable`; the vendored
+            // one used `variable_name`. Accept both.
+            if kind != "variable_name" && kind != "variable" {
+                return false;
+            }
+            node.parent()
+                .map(|p| p.kind() == "parameter")
+                .unwrap_or(false)
+        }
+        Language::FORM => {
+            if kind != "parameter" {
+                return false;
+            }
+            node.parent()
+                .map(|p| p.kind() == "parameter_list")
+                .unwrap_or(false)
+        }
+        Language::FUNC => {
+            if kind != "parameter" {
+                return false;
+            }
+            node.parent()
+                .map(|p| {
+                    p.kind() == "parameter_declaration" && field_contains_node(p, "name", node)
+                })
+                .unwrap_or(false)
+        }
+        Language::PERL => is_perl_lexical_declaration_binding(node),
+        Language::CMAKE => is_cmake_function_parameter(node),
+        Language::TCL => is_tcl_procedure_parameter(node),
+        Language::CFML => cfml_argument_tag_name_binding(node, source),
+        Language::FISH => false, // needs WalkState occurrence cursor (lands with the unified walk)
+        _ => false,
+    }
+}
+
+fn ancestor_field_binds(
+    node: tree_sitter::Node<'_>,
+    container_kind: &str,
+    fields: &[&str],
+) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == container_kind {
+            return fields.iter().any(|f| any_field_contains_node(p, f, node));
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_erlang_clause_binding(node: tree_sitter::Node<'_>) -> bool {
+    ancestor_field_binds(node, "function_clause", &["args"])
+}
+
+fn is_nix_function_binding(node: tree_sitter::Node<'_>) -> bool {
+    // tree-sitter-nix names a simple `x: body` binder `universal`;
+    // destructuring uses the distinct `formals` field.
+    ancestor_field_binds(node, "function_expression", &["universal", "formals"])
+}
+
+fn is_lean_binder_name(node: tree_sitter::Node<'_>) -> bool {
+    const BINDER_KINDS: &[&str] = &["explicit_binder", "implicit_binder", "instance_binder"];
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if BINDER_KINDS.contains(&p.kind()) {
+            return any_field_contains_node(p, "name", node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_pascal_proc_binding(node: tree_sitter::Node<'_>) -> bool {
+    ancestor_field_binds(node, "declProc", &["args"])
+        || ancestor_field_binds(node, "defProc", &["args"])
+}
+
+fn is_teal_function_binding(node: tree_sitter::Node<'_>) -> bool {
+    let mut arguments: Option<tree_sitter::Node<'_>> = None;
+    let mut current = node.parent();
+    while let Some(p) = current {
+        if arguments.is_none() && p.kind() == "arguments" {
+            arguments = Some(p);
+            current = p.parent();
+            continue;
+        }
+        match p.kind() {
+            "function_signature" => {
+                return any_field_contains_node(p, "arguments", node);
+            }
+            "function_statement" => {
+                let Some(args) = arguments else { return false };
+                return p
+                    .child_by_field_name("signature")
+                    .map(|sig| node_contains(sig, args))
+                    .unwrap_or(false);
+            }
+            _ => {}
+        }
+        current = p.parent();
+    }
+    false
+}
+
+fn is_commonlisp_defun_binding(node: tree_sitter::Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == "defun_header" {
+            return field_contains_node(p, "function_name", node)
+                || field_contains_node(p, "lambda_list", node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_hcl_attribute_binding(node: tree_sitter::Node<'_>) -> bool {
+    // HCL's attribute production exposes no fields: first named child is the
+    // key, second is the expression.
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == "attribute" {
+            return named_child_contains(p, 0, node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_matlab_argument_binding(node: tree_sitter::Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if matches!(p.kind(), "function_arguments" | "lambda_arguments") {
+            return true;
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_vhdl_interface_binding(node: tree_sitter::Node<'_>) -> bool {
+    const INTERFACE_KINDS: &[&str] = &[
+        "interface_constant_declaration",
+        "interface_signal_declaration",
+        "interface_variable_declaration",
+        "interface_declaration",
+    ];
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if INTERFACE_KINDS.contains(&p.kind()) {
+            // Every interface production starts with its identifier_list.
+            return named_child_contains(p, 0, node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+fn is_pine_function_binding(node: tree_sitter::Node<'_>) -> bool {
+    ancestor_field_binds(node, "function_declaration_statement", &["argument"])
+}
+
+/// Pkl declares names positionally: each container holds its declared name
+/// as named child 0; annotations, defaults, and bodies follow and stay
+/// reads. Resolved against the NEAREST container (C
+/// is_pkl_declaration_binding).
+fn is_pkl_declaration_binding(node: tree_sitter::Node<'_>) -> bool {
+    const DECLARATION_KINDS: &[&str] = &[
+        "methodHeader",
+        "typedIdentifier",
+        "classProperty",
+        "objectProperty",
+        "clazz",
+        "typeAlias",
+    ];
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if DECLARATION_KINDS.contains(&p.kind()) {
+            return named_child_contains(p, 0, node);
+        }
+        parent = p.parent();
+    }
+    false
+}
+
+/// Dispatch the per-language policy binding rules (C is_policy_binding).
+pub fn is_policy_binding(node: tree_sitter::Node<'_>, lang: Language, source: &str) -> bool {
+    match occurrence_spec(lang).policy {
+        OccurrencePolicy::LispDef => is_lisp_def_binding(node, lang, source),
+        OccurrencePolicy::CommonlispDefun => is_commonlisp_defun_binding(node),
+        OccurrencePolicy::FennelFn => is_fennel_fn_binding(node, source),
+        OccurrencePolicy::ElixirDef => is_elixir_def_binding(node, source),
+        OccurrencePolicy::JuliaFunction => is_first_named_part_of(node, "function_definition"),
+        OccurrencePolicy::WolframSet => is_wolfram_lhs(node),
+        OccurrencePolicy::TypstLet => is_first_named_part_of(node, "let"),
+        OccurrencePolicy::AgdaFunction => {
+            let mut parent = node.parent();
+            while let Some(p) = parent {
+                if p.kind() == "lhs" {
+                    return true;
+                }
+                parent = p.parent();
+            }
+            false
+        }
+        OccurrencePolicy::TlaplusOperator => is_tlaplus_binding(node),
+        OccurrencePolicy::CobolMove => is_cobol_move_destination(node),
+        OccurrencePolicy::HclAttribute => is_hcl_attribute_binding(node),
+        OccurrencePolicy::ElmValue => is_first_named_part_of(node, "value_declaration"),
+        OccurrencePolicy::RescriptLet => is_first_named_part_of(node, "let_binding"),
+        OccurrencePolicy::PurescriptLhs => is_first_named_part_of(node, "function"),
+        OccurrencePolicy::NickelLet => {
+            is_first_named_part_of(node, "let_binding")
+                || is_first_named_part_of(node, "pattern_fun")
+        }
+        OccurrencePolicy::ErlangClause => is_erlang_clause_binding(node),
+        OccurrencePolicy::NixFunction => is_nix_function_binding(node),
+        OccurrencePolicy::MatlabArguments => is_matlab_argument_binding(node),
+        OccurrencePolicy::LeanBinder => is_lean_binder_name(node),
+        OccurrencePolicy::PascalProc => is_pascal_proc_binding(node),
+        OccurrencePolicy::TealFunction => is_teal_function_binding(node),
+        OccurrencePolicy::VhdlInterface => is_vhdl_interface_binding(node),
+        OccurrencePolicy::PineFunction => is_pine_function_binding(node),
+        OccurrencePolicy::PklDeclaration => is_pkl_declaration_binding(node),
+        OccurrencePolicy::LlvmFunction => {
+            let mut parent = node.parent();
+            while let Some(p) = parent {
+                if p.kind() == "function_header" {
+                    return field_contains_node(p, "arguments", node);
+                }
+                parent = p.parent();
+            }
+            false
+        }
+        OccurrencePolicy::Standard => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +1650,130 @@ mod tests {
             usages.is_empty() || usages.iter().all(|u| !u.may_be_call_reference),
             "{usages:?}"
         );
+    }
+
+    // ── Occurrence policy binding rules ──
+
+    #[test]
+    fn occurrence_spec_table_covers_languages() {
+        let s = occurrence_spec(Language::SQL);
+        assert_eq!(s.whole_binding_nodes, SQL_BINDING_NODES);
+        assert_eq!(s.policy, OccurrencePolicy::Standard);
+        assert!(occurrence_spec(Language::CLOJURE).policy == OccurrencePolicy::LispDef);
+        assert!(occurrence_spec(Language::PUPPET).first_named_child_is_write);
+        assert!(occurrence_spec(Language::MESON).write_nodes == MESON_WRITE_NODES);
+        // Unlisted languages fall back to the shared STANDARD spec.
+        assert!(occurrence_spec(Language::GO).policy == OccurrencePolicy::Standard);
+        assert!(occurrence_spec(Language::GO).whole_binding_nodes.is_empty());
+    }
+
+    #[test]
+    fn policy_binding_lisp_forms() {
+        // Clojure defn: head + name bind, body doesn't.
+        let src = "(defn greet [x] (+ x 1))\n";
+        let tree = crate::ts::parse(Language::CLOJURE, src).unwrap();
+        // BFS (FIFO): the first occurrence in document order — a LIFO stack
+        // would find the BODY's `x` (a genuine read) before the parameter.
+        let find = |text: &str| {
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(tree.root_node());
+            while let Some(n) = queue.pop_front() {
+                if crate::fqn::node_text(n, src) == text {
+                    return n;
+                }
+                for i in 0..n.child_count() {
+                    if let Some(c) = n.child(i) {
+                        queue.push_back(c);
+                    }
+                }
+            }
+            panic!("node not found: {text}");
+        };
+        let greet = find("greet");
+        let x_param = find("x");
+        assert!(
+            is_policy_binding(greet, Language::CLOJURE, src),
+            "name binds"
+        );
+        assert!(
+            is_policy_binding(x_param, Language::CLOJURE, src),
+            "param vector member binds (clojure binds child 2)"
+        );
+        // The `+` head of the body list is NOT a def binding.
+        let plus = find("+");
+        assert!(!is_policy_binding(plus, Language::CLOJURE, src));
+    }
+
+    #[test]
+    fn policy_binding_hcl_attribute_key() {
+        let src = "resource \"a\" \"b\" {\n  name = \"x\"\n}\n";
+        let tree = crate::ts::parse(Language::HCL, src).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut key_node = None;
+        while let Some(n) = stack.pop() {
+            if n.kind() == "attribute" {
+                key_node = n.named_child(0);
+                break;
+            }
+            for i in 0..n.child_count() {
+                if let Some(c) = n.child(i) {
+                    stack.push(c);
+                }
+            }
+        }
+        let key = key_node.expect("hcl attribute key");
+        assert!(is_policy_binding(key, Language::HCL, src));
+    }
+
+    #[test]
+    fn policy_binding_matlab_arguments() {
+        let src = "function out = f(a, b)\nend\n";
+        let tree = crate::ts::parse(Language::MATLAB, src).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut arg_node = None;
+        while let Some(n) = stack.pop() {
+            if n.kind() == "identifier" && crate::fqn::node_text(n, src) == "a" {
+                arg_node = Some(n);
+                break;
+            }
+            for i in 0..n.child_count() {
+                if let Some(c) = n.child(i) {
+                    stack.push(c);
+                }
+            }
+        }
+        let a = arg_node.expect("matlab param");
+        assert!(is_policy_binding(a, Language::MATLAB, src));
+    }
+
+    #[test]
+    fn exact_language_binding_scss_parameter() {
+        let src = "@mixin m($x) {\n  color: $x;\n}\n";
+        let tree = crate::ts::parse(Language::SCSS, src).unwrap();
+        // crates.io grammar: `variable` nodes carry "$x" (vendored used
+        // `variable_name`).
+        let find_under = |inside: &str| {
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(tree.root_node());
+            while let Some(n) = queue.pop_front() {
+                if n.kind() == "variable"
+                    && crate::fqn::node_text(n, src) == "$x"
+                    && n.parent().map(|p| p.kind() == inside).unwrap_or(false)
+                {
+                    return n;
+                }
+                for i in 0..n.child_count() {
+                    if let Some(c) = n.child(i) {
+                        queue.push_back(c);
+                    }
+                }
+            }
+            panic!("variable not found under {inside}");
+        };
+        let param = find_under("parameter");
+        assert!(is_exact_language_binding(param, Language::SCSS, src));
+        // The body read is NOT a binding.
+        let body = find_under("declaration");
+        assert!(!is_exact_language_binding(body, Language::SCSS, src));
     }
 }
