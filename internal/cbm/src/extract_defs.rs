@@ -478,32 +478,239 @@ pub fn push_module_def(ctx: &mut ExtractCtx<'_>) {
     def.is_test = ctx.result.is_test_file;
     // #519: index what a config file declares itself to be.
     def.docstring = extract_config_module_description(ctx.root, ctx.source);
+    // A routable Blazor component carries its route on the module def: the
+    // component's class is implicit in a .razor file, so there is no class
+    // node to hang it on, and the module QN already is the component's
+    // identity.
+    if ctx.language == Language::CSHARP && path_is_razor(ctx.rel_path) {
+        if let Some(route) = razor_page_route(ctx.source) {
+            def.route_path = Some(route);
+            def.route_method = Some("GET".to_string()); // reached by navigation
+        }
+    }
     ctx.result.definitions.push(def);
 }
 
-/// Config-file self-description: a top-level `description`/`name`-style
-/// key (C extract_config_module_description, conservative subset —
-/// YAML/TOML top-level description keys).
-fn extract_config_module_description(root: tree_sitter::Node<'_>, source: &str) -> Option<String> {
-    // YAML: top-level `description:` mapping key.
-    for i in 0..root.named_child_count() {
-        let child = root.named_child(i)?;
-        if child.kind() == "block_mapping_pair" || child.kind() == "flow_pair" {
-            if let Some(key) = child.child_by_field_name("key") {
-                let key_text = crate::fqn::node_text(key, source);
-                if matches!(key_text, "description" | "summary") {
-                    if let Some(val) = child.child_by_field_name("value") {
-                        let v = crate::fqn::node_text(val, source);
-                        let v = v.trim().trim_matches(['"', '\'']).trim();
-                        if !v.is_empty() {
-                            return Some(v.to_string());
-                        }
-                    }
+/// C MAX_COMMENT_LEN.
+const MAX_COMMENT_LEN: usize = 500;
+
+/// Bytes the sequence starting with `lead` occupies (C utf8_sequence_len):
+/// 1 for ASCII or an invalid lead.
+fn utf8_sequence_len(lead: u8) -> usize {
+    if lead & 0xE0 == 0xC0 {
+        return 2;
+    }
+    if lead & 0xF0 == 0xE0 {
+        return 3;
+    }
+    if lead & 0xF8 == 0xF0 {
+        return 4;
+    }
+    1
+}
+
+/// Drop a trailing PARTIAL UTF-8 sequence left by a byte-length cut (C
+/// utf8_trim_partial_tail, #1017's rule for prose bodies).
+fn utf8_trim_partial_tail(bytes: &mut Vec<u8>) {
+    let n = bytes.len();
+    if n == 0 {
+        return;
+    }
+    let mut i = n;
+    while i > 0 && (bytes[i - 1] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    if i == 0 {
+        bytes.clear(); // continuation bytes only — not decodable
+        return;
+    }
+    let need = utf8_sequence_len(bytes[i - 1]);
+    if i - 1 + need > n {
+        bytes.truncate(i - 1);
+    }
+}
+
+/// Collapse raw prose into a single-spaced value capped at MAX_COMMENT_LEN
+/// (C collapse_prose): the same 500-byte ceiling docstrings use, leaving
+/// room inside the 2KB properties buffer that carries it.
+fn collapse_prose(src: &str) -> Option<String> {
+    if src.is_empty() {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(MAX_COMMENT_LEN + 1);
+    let mut in_ws = true; // start true so leading whitespace is swallowed
+    for &c in src.as_bytes() {
+        if out.len() >= MAX_COMMENT_LEN {
+            break;
+        }
+        if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+            in_ws = true;
+            continue;
+        }
+        if in_ws && !out.is_empty() {
+            out.push(b' ');
+            if out.len() >= MAX_COMMENT_LEN {
+                break;
+            }
+        }
+        in_ws = false;
+        out.push(c);
+    }
+    utf8_trim_partial_tail(&mut out);
+    if out.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
+/// Strip one matching pair of surrounding quotes (C strip_surrounding_quotes).
+fn strip_surrounding_quotes(t: &str) -> &str {
+    let b = t.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    }
+}
+
+/// Normalise a config scalar into an indexable value (C
+/// config_scalar_value): drop a YAML block-scalar header (`|`/`>` plus
+/// modifiers), collapse whitespace, then unquote.
+fn config_scalar_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches([' ', '\t', '\n', '\r']);
+    // C: a leading block-scalar header (`|`/`>` plus modifiers) is skipped
+    // to end-of-line; the collapse then runs over the remaining text.
+    let body = if trimmed.starts_with(['|', '>']) {
+        match trimmed.find('\n') {
+            Some(pos) => &trimmed[pos + 1..],
+            None => "",
+        }
+    } else {
+        trimmed
+    };
+    collapse_prose(body).and_then(|v| {
+        let stripped = strip_surrounding_quotes(&v);
+        (!stripped.is_empty()).then(|| stripped.to_string())
+    })
+}
+
+/// Value of `pair` when its key is `want`, else None (C
+/// config_pair_value_if_key). A YAML block_mapping_pair and a JSON pair
+/// both expose key/value fields.
+fn config_pair_value_if_key(
+    pair: tree_sitter::Node<'_>,
+    want: &str,
+    source: &str,
+) -> Option<String> {
+    let key = pair.child_by_field_name("key")?;
+    let val = pair.child_by_field_name("value")?;
+    let kt = strip_surrounding_quotes(crate::fqn::node_text(key, source));
+    if kt != want {
+        return None;
+    }
+    config_scalar_value(crate::fqn::node_text(val, source))
+}
+
+/// C config_desc_keys — priority order for a container's self-description.
+const CONFIG_DESC_KEYS: &[&str] = &["description", "summary", "purpose"];
+
+/// First non-empty description value among `container`'s direct pairs (C
+/// config_container_description), scanned in config_desc_keys order.
+fn config_container_description(
+    container: tree_sitter::Node<'_>,
+    pair_kind: &str,
+    source: &str,
+) -> Option<String> {
+    for k in CONFIG_DESC_KEYS {
+        for i in 0..container.named_child_count() {
+            let Some(pair) = container.named_child(i) else {
+                continue;
+            };
+            if pair.kind() != pair_kind {
+                continue;
+            }
+            if let Some(v) = config_pair_value_if_key(pair, k, source) {
+                if !v.is_empty() {
+                    return Some(v);
                 }
             }
         }
     }
     None
+}
+
+/// Find a JSON top-level object (C find_json_toplevel_object): root itself,
+/// a direct object child, or one nested one level deeper.
+fn find_json_toplevel_object(root: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    if root.kind() == "object" {
+        return Some(root);
+    }
+    if let Some(obj) = crate::fqn::find_child_by_kind(root, "object") {
+        return Some(obj);
+    }
+    for i in 0..root.named_child_count() {
+        if let Some(inner) = root
+            .named_child(i)
+            .and_then(|c| crate::fqn::find_child_by_kind(c, "object"))
+        {
+            return Some(inner);
+        }
+    }
+    None
+}
+
+/// #519 entry point (C extract_config_module_description): the file-level
+/// description a config document declares about itself, promoted onto the
+/// Module node so nodes_fts.body indexes it. None for other languages.
+fn extract_config_module_description(root: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    // The shape decides: YAML mapping vs JSON object.
+    if let Some(bm) = find_yaml_toplevel_mapping(root) {
+        return config_container_description(bm, "block_mapping_pair", source);
+    }
+    if let Some(obj) = find_json_toplevel_object(root) {
+        return config_container_description(obj, "pair", source);
+    }
+    None
+}
+
+/// True when rel_path names a Blazor component file (C cbm_path_is_razor):
+/// both .razor and .cshtml — `@page` defines a Razor Page, so a .cshtml
+/// route is as worth extracting as a .razor one. Deliberately not
+/// .aspx/.ascx (different templating syntax, no `@page`).
+pub fn path_is_razor(rel_path: &str) -> bool {
+    rel_path.ends_with(".razor") || rel_path.ends_with(".cshtml")
+}
+
+/// Match `@page "/route"` on ONE line (C razor_page_route_on_line).
+/// Deliberately strict: the directive must be the first token on the line,
+/// followed by whitespace and a double-quoted rooted path — so neither
+/// `@pageSize` nor a `@page` mentioned in markup prose can match.
+fn razor_page_route_on_line(line: &str) -> Option<&str> {
+    let p = line.trim_start_matches([' ', '\t']);
+    if p.is_empty() {
+        return None; // blank line — nothing can follow
+    }
+    let rest = p.strip_prefix("@page")?;
+    if !rest.starts_with([' ', '\t']) {
+        return None; // `@pageSize` and friends
+    }
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let route = &rest[..end];
+    (route.starts_with('/')).then_some(route)
+}
+
+/// Blazor route directive scan (C cbm_razor_page_route): `@page "/counter"`
+/// lives in MARKUP above the `@code` block; tree-sitter's C# grammar never
+/// parses the directive, so this scans the raw source — no Razor grammar
+/// needed. First route wins (CBMDefinition carries one route_path).
+pub fn razor_page_route(source: &str) -> Option<String> {
+    source
+        .lines()
+        .find_map(razor_page_route_on_line)
+        .map(str::to_string)
 }
 
 // ── extract_func_def (C, linked-grammar languages) ──────────────
@@ -3004,5 +3211,93 @@ def process(items):
             .map(|d| d.name.as_str())
             .collect();
         assert!(vars.contains(&"github.com/x/y"), "{vars:?}");
+    }
+
+    // ── Config description (#519) + Razor route ──
+
+    #[test]
+    fn config_description_promoted_to_module() {
+        let src = "description: Process payroll runs.\nname: payroll\n";
+        let defs = run(Language::YAML, src, "action.yml");
+        let module = defs.iter().find(|d| d.label == "Module").unwrap();
+        assert_eq!(
+            module.docstring.as_deref(),
+            Some("Process payroll runs."),
+            "{:?}",
+            module.docstring
+        );
+    }
+
+    #[test]
+    fn config_description_priority_and_block_scalar() {
+        // summary beats purpose; description beats both (priority order).
+        let src = "purpose: P\nsummary: S\ndescription: D\n";
+        let defs = run(Language::YAML, src, "meta.yaml");
+        let module = defs.iter().find(|d| d.label == "Module").unwrap();
+        assert_eq!(module.docstring.as_deref(), Some("D"));
+
+        // Block scalar: header skipped, body collapsed.
+        let src2 = "description: |\n  line one\n  line two\nkey: v\n";
+        let defs2 = run(Language::YAML, src2, "meta2.yaml");
+        let module2 = defs2.iter().find(|d| d.label == "Module").unwrap();
+        assert_eq!(
+            module2.docstring.as_deref(),
+            Some("line one line two"),
+            "{:?}",
+            module2.docstring
+        );
+    }
+
+    #[test]
+    fn json_description() {
+        let src = "{\"description\": \"API spec\", \"openapi\": \"3.0\"}\n";
+        let Some(tree) = crate::ts::parse(Language::JSON, src) else {
+            return;
+        };
+        let mut ctx = ExtractCtx::new(
+            src,
+            tree.root_node(),
+            Language::JSON,
+            "proj",
+            "openapi.json",
+        );
+        extract_definitions(&mut ctx, crate::lang_specs::lang_spec(Language::JSON));
+        let module = ctx
+            .result
+            .definitions
+            .iter()
+            .find(|d| d.label == "Module")
+            .unwrap();
+        assert_eq!(module.docstring.as_deref(), Some("API spec"));
+    }
+
+    #[test]
+    fn razor_route_extraction() {
+        assert!(path_is_razor("Pages/Counter.razor"));
+        assert!(path_is_razor("Pages/Page.cshtml"));
+        assert!(!path_is_razor("Old/WebForm.aspx"));
+        assert_eq!(
+            razor_page_route("@page \"/counter\"\n<h1>Hi</h1>"),
+            Some("/counter".to_string())
+        );
+        // Not the first token → rejected.
+        assert_eq!(razor_page_route("text @page \"/x\""), None);
+        // @pageSize rejected.
+        assert_eq!(razor_page_route("@pageSize 4"), None);
+        // Non-rooted path rejected.
+        assert_eq!(razor_page_route("@page \"counter\""), None);
+    }
+
+    #[test]
+    fn collapse_prose_caps_and_utf8() {
+        let long = "word ".repeat(200);
+        let c = collapse_prose(&long).unwrap();
+        assert!(c.len() <= 500);
+        // Multi-byte cut at the cap must not split a codepoint.
+        let uni = "字符".repeat(300);
+        let c2 = collapse_prose(&uni);
+        assert!(c2.is_some());
+        // Single-space collapsing.
+        assert_eq!(collapse_prose("a \n\t b").as_deref(), Some("a b"));
     }
 }
